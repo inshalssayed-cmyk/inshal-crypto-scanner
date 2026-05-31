@@ -45,7 +45,7 @@ def scan_market():
             volume = float(coin.get("quoteVolume", 0))
 
             # Core v1 filter
-            if 3 <= change <= 18 and volume >= 5_000_000:
+            if 1.5 <= change <= 25 and volume >= 1_000_000:
                 score = change + (volume / 100_000_000)
                 results.append((score, symbol, change, volume))
 
