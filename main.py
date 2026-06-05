@@ -1,6 +1,9 @@
 import os
+import sys
 import time
 import json
+import atexit
+import signal
 import threading
 import requests
 from flask import Flask, jsonify
@@ -15,28 +18,33 @@ KUCOIN_URL = "https://api.kucoin.com/api/v1/market/allTickers"
 # ──────────────────────────────────────────
 # Strict Alert Configuration
 # ──────────────────────────────────────────
-STRICT_SCORE_THRESHOLD = 80         # Only alert when score >= 80
-MAX_CHANGE_FOR_ALERT  = 5            # Reject already-pumped coins
-MIN_CHANGE_FOR_ALERT  = -2           # Reject big dumps
-MIN_RS_VS_BTC         = 0            # Must be stronger or equal to BTC
-MIN_VOLUME_FOR_ALERT  = 3_000_000    # Strict liquidity floor
+STRICT_SCORE_THRESHOLD = 80
+MAX_CHANGE_FOR_ALERT  = 5
+MIN_CHANGE_FOR_ALERT  = -2
+MIN_RS_VS_BTC         = 0
+MIN_VOLUME_FOR_ALERT  = 3_000_000
 
-ALERT_COOLDOWN        = 6 * 3600     # 6 hours per coin (rare, high-quality alerts)
-HISTORY_RETENTION     = 20           # Per-coin: keep last 20 score entries
-SCAN_LOG_MAX_ENTRIES  = 500          # Rolling scan log size
+ALERT_COOLDOWN        = 6 * 3600        # 6 hr cooldown per coin
+SCAN_INTERVAL         = 900             # 15 minutes between scans
+ERROR_RETRY_INTERVAL  = 300             # 5 min retry on failure
+HISTORY_RETENTION     = 20
+SCAN_LOG_MAX_ENTRIES  = 500
 
-# Files (best-effort persistence — Render free tier wipes on redeploy)
 HISTORY_FILE  = "./scan_history.json"
 SCAN_LOG_FILE = "./scan_log.json"
 
 scan_count = 0
 scan_lock = threading.Lock()
 
-last_alerted = {}             # { symbol: timestamp_of_last_alert }
+last_alerted = {}
 alerted_lock = threading.Lock()
 
-candidate_history = {}        # { symbol: [{"ts": ts, "score": score}, ...] }
+candidate_history = {}
 history_lock = threading.Lock()
+
+scanner_started = False
+scanner_start_lock = threading.Lock()
+shutdown_notified = False
 
 
 # ──────────────────────────────────────────
@@ -72,9 +80,10 @@ HOT_SECTORS = {
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram credentials missing")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    success = True
     for i in range(0, len(message), 3900):
         chunk = message[i:i + 3900]
         try:
@@ -87,8 +96,11 @@ def send_telegram(message):
             print("Telegram sent")
         except requests.exceptions.HTTPError as e:
             print(f"Telegram HTTP error: {e} | {e.response.text}")
+            success = False
         except Exception as e:
             print("Telegram error:", e)
+            success = False
+    return success
 
 
 def format_price(price):
@@ -107,7 +119,7 @@ def get_sector(symbol):
 
 
 # ──────────────────────────────────────────
-# Persistence (best-effort, won't crash if file write fails)
+# Persistence
 # ──────────────────────────────────────────
 
 def _safe_read_json(path, default):
@@ -140,22 +152,16 @@ def persist_history():
 
 
 def log_scan(scan_id, btc_change, candidates):
-    """Append scan results to log file for future ML training."""
     entry = {
         "scan_id": scan_id,
         "ts": time.time(),
         "btc_change": btc_change,
         "candidates": [
             {
-                "symbol": c["symbol"],
-                "score": c["score"],
-                "change": c["change"],
-                "volume": c["volume"],
-                "rs": c["rs"],
-                "sector": c["sector"],
+                "symbol": c["symbol"], "score": c["score"], "change": c["change"],
+                "volume": c["volume"], "rs": c["rs"], "sector": c["sector"],
                 "smart_money": c["smart_money_flag"]
-            }
-            for c in candidates[:10]
+            } for c in candidates[:10]
         ]
     }
     log = _safe_read_json(SCAN_LOG_FILE, [])
@@ -165,7 +171,7 @@ def log_scan(scan_id, btc_change, candidates):
 
 
 # ──────────────────────────────────────────
-# Market Fetch (retry + backoff)
+# Market Fetch
 # ──────────────────────────────────────────
 
 def fetch_market(retries=3, backoff=5):
@@ -191,15 +197,10 @@ def fetch_market(retries=3, backoff=5):
 
 
 # ──────────────────────────────────────────
-# Consecutive Appearance Bonus
+# Scoring
 # ──────────────────────────────────────────
 
 def consecutive_bonus(symbol):
-    """
-    Reward coins showing sustained accumulation across recent scans.
-    If a coin scores ≥65 in 3+ recent scans within 6 hours → +10 bonus.
-    This is the strongest pre-breakout signal: persistent strength.
-    """
     with history_lock:
         history = candidate_history.get(symbol, [])
     if len(history) < 3:
@@ -213,41 +214,30 @@ def consecutive_bonus(symbol):
     return 0
 
 
-# ──────────────────────────────────────────
-# Scoring (Pre-Breakout Accumulation Logic)
-# ──────────────────────────────────────────
-
 def accumulation_score(change, volume, rs_vs_btc, sector, base, symbol):
     score = 0
 
-    # 1. Sideways / not over-pumped
     if -2 <= change <= 5:   score += 25
     elif 5 < change <= 8:   score += 10
 
-    # 2. Volume strength
     if volume >= 10_000_000:  score += 25
     elif volume >= 5_000_000: score += 20
     elif volume >= 1_000_000: score += 12
 
-    # 3. Relative strength vs BTC
     if rs_vs_btc >= 4:    score += 20
     elif rs_vs_btc >= 2:  score += 15
     elif rs_vs_btc >= 0:  score += 8
 
-    # 4. Narrative / sector
     if sector in HOT_SECTORS:        score += 15
     elif sector != "Unclassified":   score += 7
 
-    # 5. Cartel historical memory
     if base in CARTEL_HISTORICAL_COINS:
         score += 10
 
-    # 6. Smart Money Proxy
     smart_money_flag = (-1 <= change <= 4) and (volume >= 5_000_000)
     if smart_money_flag:
         score += 10
 
-    # 7. Consecutive appearance bonus (sustained accumulation)
     score += consecutive_bonus(symbol)
 
     return min(score, 100), smart_money_flag
@@ -260,12 +250,7 @@ def classify(score):
     return "⚠️ LOW PRIORITY"
 
 
-# ──────────────────────────────────────────
-# Strict Alert Filter
-# ──────────────────────────────────────────
-
 def passes_strict_filter(c):
-    """All conditions must be true to be considered ready for breakout."""
     return (
         c["score"] >= STRICT_SCORE_THRESHOLD and
         MIN_CHANGE_FOR_ALERT <= c["change"] <= MAX_CHANGE_FOR_ALERT and
@@ -279,10 +264,6 @@ def passes_strict_filter(c):
 # ──────────────────────────────────────────
 
 def run_scan(force=False):
-    """
-    force=True → always send a message (manual testing via /scan)
-    force=False → silent unless strict criteria met (cron via /cron)
-    """
     global scan_count
 
     with scan_lock:
@@ -320,8 +301,6 @@ def run_scan(force=False):
 
         if price <= 0 or volume <= 0:
             continue
-
-        # Pre-breakout pre-filter (broad, before scoring)
         if not (-3 <= change <= 8):
             continue
         if volume < 1_000_000:
@@ -332,14 +311,9 @@ def run_scan(force=False):
         score, smart_money_flag = accumulation_score(change, volume, rs_vs_btc, sector, base, symbol)
 
         candidates.append({
-            "symbol": symbol,
-            "base": base,
-            "price": price,
-            "change": change,
-            "volume": volume,
-            "rs": rs_vs_btc,
-            "sector": sector,
-            "score": score,
+            "symbol": symbol, "base": base, "price": price,
+            "change": change, "volume": volume, "rs": rs_vs_btc,
+            "sector": sector, "score": score,
             "smart_money_flag": smart_money_flag,
             "label": classify(score),
             "cartel_memory": "Yes" if base in CARTEL_HISTORICAL_COINS else "No",
@@ -348,15 +322,12 @@ def run_scan(force=False):
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top_candidates = candidates[:15]
 
-    # Update per-coin history for top candidates (for consecutive bonus)
     with history_lock:
         for c in top_candidates:
             if c["score"] >= 65:
                 lst = candidate_history.setdefault(c["symbol"], [])
                 lst.append({"ts": now, "score": c["score"]})
                 candidate_history[c["symbol"]] = lst[-HISTORY_RETENTION:]
-
-        # Garbage collect: drop entirely if last entry > 24h old
         stale = [k for k, v in candidate_history.items() if not v or now - v[-1]["ts"] > 86400]
         for k in stale:
             del candidate_history[k]
@@ -366,10 +337,8 @@ def run_scan(force=False):
 
     print(f"Scan #{current_scan} | BTC: {btc_change:.2f}% | Coins: {len(data)} | Top: {len(top_candidates)}")
 
-    # ── STRICT ALERT FILTER ──
     strict_alerts = [c for c in top_candidates if passes_strict_filter(c)]
 
-    # Dedup (drop coins still in cooldown)
     with alerted_lock:
         expired = [k for k, t in last_alerted.items() if now - t > ALERT_COOLDOWN]
         for k in expired:
@@ -379,12 +348,10 @@ def run_scan(force=False):
         for c in strict_alerts:
             last_alerted[c["symbol"]] = now
 
-    # ── SILENT MODE: no alerts to send, no force → return None ──
     if not strict_alerts and not force:
-        print(f"Scan #{current_scan}: no breakout-ready setups. Staying silent.")
+        print(f"Scan #{current_scan}: silent (no breakout-ready setup).")
         return None
 
-    # ── FORCED (manual) but nothing strict-passing → show diagnostic ──
     if not strict_alerts and force:
         msg = "🔍 <b>Inshal Scanner v8 — Manual Scan</b>\n"
         msg += f"Scan #{current_scan} | ₿ BTC 24h: {btc_change:.2f}%\n\n"
@@ -399,11 +366,9 @@ def run_scan(force=False):
                 )
         return msg
 
-    # ── ALERT MODE: real breakout-ready setups ──
     msg = "🚨 <b>PRE-BREAKOUT WATCHLIST</b>\n"
     msg += "🎯 Inshal Crypto Scanner v8 — Silent Accumulation Mode\n"
-    msg += "📊 KuCoin Spot | "
-    msg += f"Scan #{current_scan} | ₿ BTC: {btc_change:.2f}%\n\n"
+    msg += f"📊 KuCoin Spot | Scan #{current_scan} | ₿ BTC: {btc_change:.2f}%\n\n"
 
     for c in strict_alerts:
         smart_money_line = "🐋 Smart Money Proxy: TRIGGERED\n" if c["smart_money_flag"] else ""
@@ -429,12 +394,110 @@ def run_scan(force=False):
 
 
 # ──────────────────────────────────────────
+# AUTO BACKGROUND SCANNER
+# ──────────────────────────────────────────
+
+def scanner_loop():
+    """Auto-scan every 15 min, send startup ping, handle errors gracefully."""
+
+    # ── STARTUP NOTIFICATION ──
+    send_telegram(
+        "🟢 <b>Inshal Crypto Scanner v8 — STARTED</b>\n\n"
+        "✅ Auto-scanning every 15 minutes\n"
+        "🎯 Mode: Silent Pre-Breakout Accumulation\n"
+        f"📏 Score threshold: ≥ {STRICT_SCORE_THRESHOLD}/100\n"
+        f"⏱ Cooldown per coin: {ALERT_COOLDOWN // 3600} hours\n\n"
+        "📡 Source: KuCoin Spot Market\n\n"
+        "ℹ️ You will only receive alerts when coins meet strict pre-breakout criteria. "
+        "Silent scans are normal — they mean the market has no high-quality setup right now."
+    )
+    print("Scanner loop started.")
+
+    consecutive_failures = 0
+
+    while True:
+        try:
+            message = run_scan(force=False)
+            if message:
+                send_telegram(message)
+            consecutive_failures = 0
+
+        except Exception as e:
+            consecutive_failures += 1
+            print(f"Scan failed ({consecutive_failures}x): {e}")
+
+            # Notify on first failure, then every 4th to avoid spam
+            if consecutive_failures == 1 or consecutive_failures % 4 == 0:
+                send_telegram(
+                    f"⚠️ <b>Scanner Error</b>\n\n"
+                    f"Consecutive failures: {consecutive_failures}\n"
+                    f"Error: {str(e)[:300]}\n\n"
+                    f"Will retry in {ERROR_RETRY_INTERVAL // 60} minutes."
+                )
+            time.sleep(ERROR_RETRY_INTERVAL)
+            continue
+
+        time.sleep(SCAN_INTERVAL)
+
+
+def ensure_scanner_started():
+    """Start the background thread exactly once (safe against double-import)."""
+    global scanner_started
+    with scanner_start_lock:
+        if not scanner_started:
+            scanner_started = True
+            t = threading.Thread(target=scanner_loop, daemon=True)
+            t.start()
+            print("Background scanner thread launched.")
+
+
+# ──────────────────────────────────────────
+# GRACEFUL SHUTDOWN NOTIFICATION
+# ──────────────────────────────────────────
+
+def notify_shutdown(reason="Render restart or shutdown"):
+    """Send Telegram message when scanner stops. Only fires once."""
+    global shutdown_notified
+    if shutdown_notified:
+        return
+    shutdown_notified = True
+    try:
+        send_telegram(
+            f"🔴 <b>Inshal Crypto Scanner v8 — STOPPED</b>\n\n"
+            f"Reason: {reason}\n"
+            f"Total scans completed: {scan_count}\n\n"
+            f"⚠️ Scanner is no longer monitoring the market.\n"
+            f"If this was unexpected, check your Render dashboard."
+        )
+    except Exception as e:
+        print("Shutdown notify error:", e)
+
+
+def handle_sigterm(signum, frame):
+    notify_shutdown("SIGTERM received (Render redeploy or shutdown)")
+    sys.exit(0)
+
+
+def handle_sigint(signum, frame):
+    notify_shutdown("SIGINT received (manual interrupt)")
+    sys.exit(0)
+
+
+atexit.register(notify_shutdown, "Process exiting normally")
+signal.signal(signal.SIGTERM, handle_sigterm)
+try:
+    signal.signal(signal.SIGINT, handle_sigint)
+except Exception:
+    pass
+
+
+# ──────────────────────────────────────────
 # Flask Routes
 # ──────────────────────────────────────────
 
 @app.route("/")
 def home():
-    return f"Inshal Crypto Scanner v8 (Silent Mode) running. Scans completed: {scan_count}"
+    return f"Inshal Crypto Scanner v8 (Auto Silent Mode) running. Scans completed: {scan_count}"
 
 
 @app.route("/health")
@@ -444,13 +507,12 @@ def health():
 
 @app.route("/test")
 def test():
-    send_telegram("🧪 Test message from Inshal Crypto Scanner v8.")
-    return "Test sent."
+    ok = send_telegram("🧪 Test message from Inshal Crypto Scanner v8.")
+    return "Test sent." if ok else "Test failed — check logs.", (200 if ok else 500)
 
 
 @app.route("/scan")
 def manual_scan():
-    """Manual scan — always returns a message even if nothing strict-passing."""
     try:
         message = run_scan(force=True)
         if message:
@@ -461,54 +523,27 @@ def manual_scan():
         return str(e), 500
 
 
-@app.route("/cron")
-def cron_scan():
-    """Cron scan — silent unless strict pre-breakout setup found."""
-    try:
-        message = run_scan(force=False)
-        if message:
-            send_telegram(message)
-            return "Cron scan: alert sent."
-        return "Cron scan: silent (no breakout-ready setup)."
-    except Exception as e:
-        send_telegram(f"❌ <b>Scanner Error</b>\n\n{str(e)}")
-        return str(e), 500
-
-
-@app.route("/startup")
-def startup():
-    send_telegram(
-        "✅ <b>Inshal Crypto Scanner v8 — online</b>\n"
-        "🎯 Mode: Silent Pre-Breakout Accumulation\n\n"
-        f"⛔ Will NOT alert every 15 min.\n"
-        f"✅ Only fires when score ≥ {STRICT_SCORE_THRESHOLD} AND all strict conditions met.\n"
-        f"⏱ Cooldown per coin: {ALERT_COOLDOWN // 3600} hours\n\n"
-        "Endpoints:\n"
-        "• /health → UptimeRobot (5 min)\n"
-        "• /cron → cron-job.org (15 min)\n"
-        "• /scan → manual diagnostic"
-    )
-    return "Startup message sent."
-
-
 @app.route("/history")
 def history():
-    """Inspect tracked coin history (for ML/debugging)."""
     with history_lock:
         snapshot = {k: v[-5:] for k, v in candidate_history.items()}
-    return jsonify({
-        "tracked_coins": len(snapshot),
-        "data": snapshot
-    })
+    return jsonify({"tracked_coins": len(snapshot), "data": snapshot})
 
 
 @app.route("/log")
 def log():
-    """Inspect rolling scan log (ML training data)."""
     log_data = _safe_read_json(SCAN_LOG_FILE, [])
+    return jsonify({"total_scans_logged": len(log_data), "recent": log_data[-10:]})
+
+
+@app.route("/status")
+def status():
     return jsonify({
-        "total_scans_logged": len(log_data),
-        "recent": log_data[-10:]
+        "scanner_running": scanner_started,
+        "scans_completed": scan_count,
+        "coins_in_cooldown": len(last_alerted),
+        "coins_tracked": len(candidate_history),
+        "strict_threshold": STRICT_SCORE_THRESHOLD,
     })
 
 
@@ -517,6 +552,7 @@ def log():
 # ──────────────────────────────────────────
 
 load_state()
+ensure_scanner_started()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
