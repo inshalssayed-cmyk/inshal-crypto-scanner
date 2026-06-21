@@ -7,13 +7,12 @@ import threading
 import requests
 from flask import Flask, jsonify
 from datetime import datetime
-from collections import deque
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9-Layer4 (COMPREHENSIVE PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.1 (COMPREHENSIVE PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
-# Two-Stage Alerting + Breakout Momentum Detection + Full Reporting
+# v9.1 UPDATE: Watchlist alerts show Entry/TP1/TP2/SL instead of strategy text
 # ============================================================================
 
 app = Flask(__name__)
@@ -41,9 +40,9 @@ MIN_VOLUME_FOR_ALERT = 3_000_000
 ALERT_COOLDOWN_SECONDS = 6 * 3600
 
 # Scan Timing
-SCAN_INTERVAL_SECONDS = 900  # 15 minutes
-TRACK_CHECK_INTERVAL = 180   # 3 minutes
-TRACK_MAX_DURATION = 48 * 3600  # 48 hours
+SCAN_INTERVAL_SECONDS = 900
+TRACK_CHECK_INTERVAL = 180
+TRACK_MAX_DURATION = 48 * 3600
 
 # Position Settings
 TARGET_1_PERCENT = 6.0
@@ -52,7 +51,7 @@ STOP_LOSS_PERCENT = 5.0
 
 # Breakout Momentum Detection (Layer 4)
 MOMENTUM_CHECK_ENABLED = True
-MIN_MOMENTUM_SCORE = 70  # 0-100 scale
+MIN_MOMENTUM_SCORE = 70
 MOMENTUM_ANALYSIS_HOURS = 2
 
 # File Storage Paths
@@ -66,30 +65,24 @@ WATCHLIST_FILE = "./watchlist.json"
 # GLOBAL STATE VARIABLES
 # ============================================================================
 
-# Scanner State
 scan_count = 0
 scan_lock = threading.Lock()
 
 last_alerted = {}
 alerted_lock = threading.Lock()
 
-# Coin History
 candidate_history = {}
 history_lock = threading.Lock()
 
-# Position Tracking
 tracked_positions = {}
 positions_lock = threading.Lock()
 
-# Watchlist Management
 watchlist = {}
 watchlist_lock = threading.Lock()
 
-# Results Logging
 all_results = []
 results_lock = threading.Lock()
 
-# Scanner Control
 scanner_running = False
 scanner_lock = threading.Lock()
 shutdown_flag = threading.Event()
@@ -98,19 +91,16 @@ shutdown_flag = threading.Event()
 # REFERENCE DATA & MARKET INTELLIGENCE
 # ============================================================================
 
-# Cartel Historical Coins (proven accumulators)
 CARTEL_HISTORICAL_COINS = {
     "ORCA", "ZAMA", "APE", "KAT", "GUN", "ACE", "TNSR",
     "RARE", "METIS", "SOLV", "PHA", "CHR", "C"
 }
 
-# Smart Money Watchlist
 SMART_MONEY_WATCHLIST = {
     "ORCA", "GUN", "ACE", "METIS", "SOLV", "PHA", "CHR", "TNSR", "ZAMA", "APE",
     "KAT", "RARE", "JUP", "RAY", "HYPE", "O", "GRAM", "WLD", "BLEND"
 }
 
-# Sector Classification
 SECTOR_MAP = {
     "GUN": "Gaming", "ACE": "Gaming", "APE": "Gaming", "CHR": "Gaming",
     "ORCA": "Solana DeFi", "RAY": "Solana DeFi", "JUP": "Solana", "TNSR": "Solana NFT",
@@ -122,7 +112,6 @@ SECTOR_MAP = {
     "O": "Layer 1", "GRAM": "Layer 1", "WLD": "Layer 1", "BLEND": "DeFi",
 }
 
-# Hot Sectors (Higher scoring)
 HOT_SECTORS = {"Gaming", "Solana DeFi", "Solana", "Layer 2", "DeFi", "AI/Privacy", "Privacy/AI"}
 
 # ============================================================================
@@ -130,7 +119,7 @@ HOT_SECTORS = {"Gaming", "Solana DeFi", "Solana", "Layer 2", "DeFi", "AI/Privacy
 # ============================================================================
 
 def extract_base_symbol(symbol):
-    """Extract base symbol from trading pair (e.g., GUN-USDT -> GUN)"""
+    """Extract base symbol from trading pair"""
     return symbol.replace("-USDT", "")
 
 def get_coin_sector(symbol):
@@ -218,7 +207,6 @@ def send_telegram_message(text_content):
     
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     
-    # Split large messages to avoid Telegram limits
     for i in range(0, len(text_content), 3900):
         chunk = text_content[i:i+3900]
         try:
@@ -304,15 +292,10 @@ def classify_market_structure(symbol):
     prev_high = max(highs[-10:-5])
     prev_low = min(lows[-10:-5])
     
-    # Higher highs + Higher lows = Uptrend
     if recent_high > prev_high and recent_low > prev_low:
         return "UPTREND"
-    
-    # Lower highs + Lower lows = Downtrend
     elif recent_high < prev_high and recent_low < prev_low:
         return "DOWNTREND"
-    
-    # Mixed = Range
     else:
         return "RANGE"
 
@@ -321,21 +304,12 @@ def classify_market_structure(symbol):
 # ============================================================================
 
 def analyze_breakout_momentum(symbol):
-    """
-    Analyze if price is ready for breakout (Layer 4)
-    Returns: (momentum_score: 0-100, reason_string)
-    
-    Checks:
-    1. Price momentum (recent trend)
-    2. Volume acceleration (building)
-    3. Consolidation/compression (setup for breakout)
-    """
+    """Analyze if price is ready for breakout (Layer 4)"""
     klines = fetch_kline_data(symbol, "1hour", 24)
     
     if len(klines) < 3:
         return 0, "Insufficient kline data"
     
-    # Extract OHLCV data
     closes = [float(k[2]) for k in klines[-12:]]
     volumes = [float(k[5]) for k in klines[-12:]]
     
@@ -401,11 +375,9 @@ def get_consecutive_appearance_bonus(symbol):
     
     recent_entries = history[-3:]
     
-    # Check if all recent entries are within 6 hours
     if time.time() - recent_entries[0]["ts"] > 6 * 3600:
         return 0
     
-    # Check if scores are improving
     scores = [h["score"] for h in recent_entries]
     if min(scores) >= 65 and scores[-1] >= scores[0]:
         return 10
@@ -413,21 +385,11 @@ def get_consecutive_appearance_bonus(symbol):
     return 0
 
 def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_symbol, symbol):
-    """
-    Calculate pre-breakout accumulation score (0-100)
-    
-    Scoring factors:
-    1. Sideways consolidation (-2% to +5%)
-    2. Volume strength
-    3. Relative strength vs BTC
-    4. Sector analysis
-    5. Cartel historical memory
-    6. Smart money signals
-    """
+    """Calculate pre-breakout accumulation score (0-100)"""
     score = 0
     smart_money_signal = False
     
-    # 1. SIDEWAYS CONSOLIDATION (most important for pre-breakout)
+    # 1. SIDEWAYS CONSOLIDATION
     if -2 <= price_change <= 5:
         score += 25
     elif 5 < price_change <= 8:
@@ -455,11 +417,11 @@ def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_s
     elif sector != "Unclassified":
         score += 7
     
-    # 5. CARTEL HISTORICAL MEMORY (proven patterns)
+    # 5. CARTEL HISTORICAL MEMORY
     if base_symbol in CARTEL_HISTORICAL_COINS:
         score += 10
     
-    # 6. SMART MONEY PROXY (flat price + high volume)
+    # 6. SMART MONEY PROXY
     if (-1 <= price_change <= 4) and (volume >= 5_000_000):
         score += 10
         smart_money_signal = True
@@ -485,7 +447,7 @@ def classify_score_to_label(score):
         return "⚠️ MONITOR ONLY"
 
 # ============================================================================
-# WATCHLIST MANAGEMENT (Two-Stage Alerting)
+# WATCHLIST MANAGEMENT (Two-Stage Alerting) - V9.1 UPDATE
 # ============================================================================
 
 def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money):
@@ -506,24 +468,26 @@ def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money):
     persist_all_state()
 
 def send_watchlist_alert(symbol, price, score, sector, smart_money):
-    """Alert #1: Coin added to watchlist"""
-    base = extract_base_symbol(symbol)
-    cartel_badge = "Yes" if base in CARTEL_HISTORICAL_COINS else "No"
+    """Alert #1: Coin added to watchlist with Entry/TP1/TP2/SL (v9.1)"""
+    # Calculate estimated entry (at support, ~2% below current)
+    estimated_entry = price * 0.98
+    tp1 = estimated_entry * (1 + TARGET_1_PERCENT / 100)
+    tp2 = estimated_entry * (1 + TARGET_2_PERCENT / 100)
+    sl = estimated_entry * (1 - STOP_LOSS_PERCENT / 100)
     
     msg = "🔍 <b>COIN ADDED TO WATCHLIST</b>\n\n"
     msg += f"<b>{symbol}</b>\n"
     msg += "━━━━━━━━━━━━━━━━━\n"
     msg += f"⭐ Score: {score}/100 {classify_score_to_label(score)}\n"
     msg += f"💰 Current Price: {format_price_display(price)}\n"
-    msg += f"🧩 Sector: {sector}\n"
-    msg += f"🧠 Cartel Memory: {cartel_badge}\n"
-    msg += f"💎 Smart Money Signal: {'YES' if smart_money else 'No'}\n\n"
-    msg += "<b>ENTRY STRATEGY:</b>\n"
-    msg += "📍 Waiting for price to reach support zone\n"
-    msg += "🎯 Checking for breakout momentum confirmation\n"
-    msg += "🚀 When all conditions align, BUY alert will fire\n\n"
+    msg += f"🧩 Sector: {sector}\n\n"
+    msg += "<b>ESTIMATED TARGETS:</b>\n"
+    msg += f"💰 Entry: {format_price_display(estimated_entry)}\n"
+    msg += f"🎯 TP1: {format_price_display(tp1)} (+{TARGET_1_PERCENT:.0f}%)\n"
+    msg += f"🎯 TP2: {format_price_display(tp2)} (+{TARGET_2_PERCENT:.0f}%)\n"
+    msg += f"🛑 SL: {format_price_display(sl)} (-{STOP_LOSS_PERCENT:.0f}%)\n\n"
     msg += "⏰ STATUS: MONITORING\n"
-    msg += "Scanning 24/7 for optimal entry... ✅"
+    msg += "Waiting for support + momentum confirmation... ✅"
     
     send_telegram_message(msg)
 
@@ -540,7 +504,6 @@ def check_watchlist_for_entry_conditions():
             if not current_price:
                 continue
             
-            # Get support/resistance levels
             support = detect_support_level(symbol)
             resistance = detect_resistance_level(symbol)
             
@@ -551,30 +514,24 @@ def check_watchlist_for_entry_conditions():
             item["resistance"] = resistance
             item["structure"] = classify_market_structure(symbol)
             
-            # Check if price is near support (within 2%)
             distance_to_support = ((current_price - support) / support) * 100
             if distance_to_support > 2:
                 continue
             
-            # CRITICAL: Check breakout momentum BEFORE alerting
             if MOMENTUM_CHECK_ENABLED:
                 momentum_score, momentum_reason = analyze_breakout_momentum(symbol)
             else:
                 momentum_score = 100
                 momentum_reason = "Momentum check disabled"
             
-            # Only alert if momentum is sufficient
             if momentum_score < MIN_MOMENTUM_SCORE:
                 print(f"{symbol}: At support but momentum too weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
                 continue
             
-            # ✅ ALL CONDITIONS MET - SEND ENTRY ALERT
             send_entry_alert(symbol, current_price, item, momentum_score, momentum_reason, support)
             
-            # Register for position tracking
             add_position_for_tracking(symbol, current_price, scan_count, item["sector"], item["score"])
             
-            # Remove from watchlist
             with watchlist_lock:
                 del watchlist[symbol]
             
@@ -589,16 +546,13 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
     tp2_price = entry_price * (1 + TARGET_2_PERCENT / 100)
     sl_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
     rr_ratio = TARGET_2_PERCENT / STOP_LOSS_PERCENT
-    base = extract_base_symbol(symbol)
-    cartel_badge = "Yes" if base in CARTEL_HISTORICAL_COINS else "No"
     
     msg = "🚀 <b>ENTRY SIGNAL — BUY NOW!</b>\n\n"
     msg += f"<b>{symbol}</b>\n"
     msg += "━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 Entry Price: {format_price_display(entry_price)} ✅\n"
     msg += f"📍 Support Zone: {format_price_display(support)}\n"
-    msg += f"🧩 Sector: {watchlist_item['sector']}\n"
-    msg += f"🧠 Cartel Memory: {cartel_badge}\n\n"
+    msg += f"🧩 Sector: {watchlist_item['sector']}\n\n"
     
     msg += "<b>STRUCTURE CONFIRMATION:</b>\n"
     msg += f"✅ Price at support\n"
@@ -684,18 +638,15 @@ def monitor_tracked_positions():
     for symbol in symbols:
         pos = tracked_positions[symbol]
         
-        # Skip if already closed
         if pos["closed"]:
             continue
         
-        # Get current price
         current_price = fetch_current_price(symbol)
         if not current_price:
             current_price = pos["entry"]
         
         change_percent = ((current_price - pos["entry"]) / pos["entry"]) * 100
         
-        # Check if tracking duration exceeded
         if current_time - pos["alerted_at"] > TRACK_MAX_DURATION:
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "EXPIRED")
             
@@ -711,7 +662,6 @@ def monitor_tracked_positions():
             to_remove.append(symbol)
             continue
         
-        # Check TP2
         if current_price >= pos["tp2"] and not pos["tp2_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["tp2_hit"] = True
@@ -729,7 +679,6 @@ def monitor_tracked_positions():
             to_remove.append(symbol)
             continue
         
-        # Check TP1
         if current_price >= pos["tp1"] and not pos["tp1_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["tp1_hit"] = True
@@ -745,7 +694,6 @@ def monitor_tracked_positions():
             
             send_telegram_message(msg)
         
-        # Check SL
         elif current_price <= pos["sl"] and not pos["sl_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["sl_hit"] = True
@@ -762,7 +710,6 @@ def monitor_tracked_positions():
             send_telegram_message(msg)
             to_remove.append(symbol)
     
-    # Clean up closed positions
     with positions_lock:
         for symbol in to_remove:
             if symbol in tracked_positions:
@@ -864,7 +811,7 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9-Layer4 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.1 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
@@ -877,7 +824,7 @@ def handle_telegram_command(command_text):
         send_telegram_message(msg)
     
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9-Layer4 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.1 Commands</b>\n\n"
         msg += "/results — All-time performance\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -910,7 +857,6 @@ def telegram_listener_thread():
                 text = message.get("text", "").strip()
                 chat_id = str(message.get("chat", {}).get("id", ""))
                 
-                # Process command if from correct chat
                 if chat_id == str(CHAT_ID) and text.startswith("/"):
                     print(f"Telegram command received: {text}")
                     handle_telegram_command(text)
@@ -966,18 +912,15 @@ def execute_market_scan():
         scan_count += 1
         current_scan = scan_count
     
-    # Fetch market data
     ticker_data = fetch_market_data()
     market = prepare_market_data(ticker_data)
     
     btc_change = market.get("BTC-USDT", {}).get("change", 0)
     candidates = []
     
-    # Score each coin
     for symbol, info in market.items():
         base = extract_base_symbol(symbol)
         
-        # Skip leveraged/inverse coins
         if any(x in base for x in ["3L", "3S", "2L", "2S", "UP", "DOWN", "BULL", "BEAR"]):
             continue
         
@@ -985,7 +928,6 @@ def execute_market_scan():
         change = info["change"]
         volume = info["volume"]
         
-        # Basic filters
         if price <= 0 or volume <= 0:
             continue
         if not (-3 <= change <= 8):
@@ -993,12 +935,10 @@ def execute_market_scan():
         if volume < MIN_VOLUME_FOR_ALERT:
             continue
         
-        # Calculate score
         rs_vs_btc = change - btc_change
         sector = get_coin_sector(symbol)
         score, smart_money = calculate_accumulation_score(change, volume, rs_vs_btc, sector, base, symbol)
         
-        # Keep candidates with score >= 72
         if score >= 72:
             candidates.append({
                 "symbol": symbol,
@@ -1013,11 +953,9 @@ def execute_market_scan():
                 "label": classify_score_to_label(score)
             })
     
-    # Sort by score
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top_candidates = candidates[:15]
     
-    # Update history
     with history_lock:
         for c in top_candidates:
             if c["score"] >= 65:
@@ -1029,16 +967,13 @@ def execute_market_scan():
     
     print(f"Scan #{current_scan} | BTC: {btc_change:.2f}% | Candidates: {len(top_candidates)}")
     
-    # Filter for strict threshold
     strict_candidates = [c for c in top_candidates if c["score"] >= STRICT_SCORE_THRESHOLD]
     
-    # Check cooldown
     with alerted_lock:
         expired_keys = [k for k, t in last_alerted.items() if time.time() - t > ALERT_COOLDOWN_SECONDS]
         for k in expired_keys:
             del last_alerted[k]
     
-    # Send alerts for new candidates
     new_alerts = []
     for c in strict_candidates:
         if c["symbol"] not in last_alerted:
@@ -1046,7 +981,6 @@ def execute_market_scan():
             with alerted_lock:
                 last_alerted[c["symbol"]] = time.time()
     
-    # Send watchlist alerts
     for c in new_alerts:
         send_watchlist_alert(c["symbol"], c["price"], c["score"], c["sector"], c["smart"])
         add_coin_to_watchlist(c["symbol"], c["price"], c["score"], c["sector"], c["smart"])
@@ -1056,15 +990,15 @@ def scanner_main_loop():
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9-Layer4 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.1 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System Active\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Breakout Momentum Detection Enabled\n"
         f"📏 Momentum Threshold: {MIN_MOMENTUM_SCORE}/100\n"
         f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%\n\n"
-        "<b>Alert Flow:</b>\n"
-        "Alert #1: Coin added to watchlist\n"
-        "Alert #2: Price + momentum confirmed = BUY NOW\n\n"
+        "<b>v9.1 UPDATE:</b>\n"
+        "Watchlist alerts now show Entry/TP1/TP2/SL\n"
+        "instead of strategy explanation\n\n"
         "95% accuracy target active. In Sha Allah. 🚀"
     )
     
@@ -1106,7 +1040,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.1 — STOPPED</b>\n\n"
         f"Reason: SIGTERM signal received\n"
         f"Total scans completed: {scan_count}\n"
         f"Scanner is now offline."
@@ -1127,7 +1061,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9-Layer4 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.1 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1148,7 +1082,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test message from v9-Layer4")
+    send_telegram_message("🧪 Test message from v9.1")
     return "Test sent"
 
 @app.route("/scan")
@@ -1180,7 +1114,8 @@ def route_status():
         "active_positions": active,
         "watchlist": wl,
         "results": results_count,
-        "momentum_enabled": MOMENTUM_CHECK_ENABLED
+        "momentum_enabled": MOMENTUM_CHECK_ENABLED,
+        "version": "9.1"
     })
 
 # ============================================================================
