@@ -9,16 +9,17 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.1 (COMPREHENSIVE PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.1 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
-# v9.1 UPDATE: Watchlist alerts show Entry/TP1/TP2/SL instead of strategy text
+# v9.1: Watchlist alerts show Entry/TP1/TP2/SL (clean format)
+# STRICT MODE: High quality trades only
 # ============================================================================
 
 app = Flask(__name__)
 
 # ============================================================================
-# CONFIGURATION SECTION
+# CONFIGURATION (STRICT MODE)
 # ============================================================================
 
 # API Credentials
@@ -32,37 +33,39 @@ KUCOIN_TICKERS = f"{KUCOIN_BASE_URL}/market/allTickers"
 KUCOIN_PRICE = f"{KUCOIN_BASE_URL}/market/orderbook/level1"
 KUCOIN_KLINES = f"{KUCOIN_BASE_URL}/market/candles"
 
-# Scanner Configuration (95% Accuracy Target)
-STRICT_SCORE_THRESHOLD = 85
+# STRICT MODE: Score & Momentum Thresholds
+STRICT_SCORE_THRESHOLD = 85  # STRICT: Only elite coins
 MAX_PRICE_CHANGE = 8
 MIN_PRICE_CHANGE = -2
 MIN_VOLUME_FOR_ALERT = 3_000_000
 ALERT_COOLDOWN_SECONDS = 6 * 3600
 
 # Scan Timing
-SCAN_INTERVAL_SECONDS = 900
-TRACK_CHECK_INTERVAL = 180
-TRACK_MAX_DURATION = 48 * 3600
+SCAN_INTERVAL_SECONDS = 900  # 15 minutes
+TRACK_CHECK_INTERVAL = 180   # 3 minutes
+TRACK_MAX_DURATION = 48 * 3600  # 48 hours
 
-# Position Settings
+# Position Settings (TP/SL locked)
 TARGET_1_PERCENT = 6.0
 TARGET_2_PERCENT = 12.0
 STOP_LOSS_PERCENT = 5.0
 
-# Breakout Momentum Detection (Layer 4)
+# Breakout Momentum Detection (Layer 4) - STRICT MODE
 MOMENTUM_CHECK_ENABLED = True
-MIN_MOMENTUM_SCORE = 70
+MIN_MOMENTUM_SCORE = 70  # STRICT: Require strong momentum
 MOMENTUM_ANALYSIS_HOURS = 2
 
-# File Storage Paths
+# Support Entry Distance - STRICT MODE
+MAX_SUPPORT_DISTANCE_PERCENT = 2.0  # STRICT: Tight entry zone
+
+# File Storage
 HISTORY_FILE = "./scan_history.json"
-SCAN_LOG_FILE = "./scan_log.json"
 POSITIONS_FILE = "./positions.json"
 RESULTS_FILE = "./results.json"
 WATCHLIST_FILE = "./watchlist.json"
 
 # ============================================================================
-# GLOBAL STATE VARIABLES
+# GLOBAL STATE
 # ============================================================================
 
 scan_count = 0
@@ -88,7 +91,7 @@ scanner_lock = threading.Lock()
 shutdown_flag = threading.Event()
 
 # ============================================================================
-# REFERENCE DATA & MARKET INTELLIGENCE
+# MARKET INTELLIGENCE DATABASE
 # ============================================================================
 
 CARTEL_HISTORICAL_COINS = {
@@ -115,15 +118,15 @@ SECTOR_MAP = {
 HOT_SECTORS = {"Gaming", "Solana DeFi", "Solana", "Layer 2", "DeFi", "AI/Privacy", "Privacy/AI"}
 
 # ============================================================================
-# UTILITY & FORMATTING FUNCTIONS
+# UTILITY FUNCTIONS
 # ============================================================================
 
 def extract_base_symbol(symbol):
-    """Extract base symbol from trading pair"""
+    """Extract base from trading pair"""
     return symbol.replace("-USDT", "")
 
 def get_coin_sector(symbol):
-    """Get sector classification for a symbol"""
+    """Get sector for symbol"""
     base = extract_base_symbol(symbol)
     return SECTOR_MAP.get(base, "Unclassified")
 
@@ -139,12 +142,12 @@ def format_price_display(price):
         return f"${price:.8f}"
 
 def format_percentage(percent_value):
-    """Format percentage for display"""
+    """Format percentage"""
     sign = "+" if percent_value >= 0 else ""
     return f"{sign}{percent_value:.2f}%"
 
 def safe_json_read(filepath, default_value):
-    """Safely read JSON file with error handling"""
+    """Safe JSON read"""
     try:
         if os.path.exists(filepath):
             with open(filepath, 'r') as f:
@@ -154,7 +157,7 @@ def safe_json_read(filepath, default_value):
     return default_value
 
 def safe_json_write(filepath, data):
-    """Safely write JSON file with error handling"""
+    """Safe JSON write"""
     try:
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
@@ -164,7 +167,7 @@ def safe_json_write(filepath, data):
         return False
 
 def load_persistent_state():
-    """Load all persistent state from disk"""
+    """Load state from disk"""
     global candidate_history, tracked_positions, watchlist, all_results
     
     with history_lock:
@@ -179,28 +182,25 @@ def load_persistent_state():
     with results_lock:
         all_results = safe_json_read(RESULTS_FILE, [])
     
-    print(f"✅ State loaded: {len(candidate_history)} history, {len(tracked_positions)} positions, {len(watchlist)} watchlist, {len(all_results)} results")
+    print(f"✅ State loaded")
 
 def persist_all_state():
-    """Persist all state to disk"""
+    """Save state to disk"""
     with history_lock:
         safe_json_write(HISTORY_FILE, candidate_history)
-    
     with positions_lock:
         safe_json_write(POSITIONS_FILE, tracked_positions)
-    
     with watchlist_lock:
         safe_json_write(WATCHLIST_FILE, watchlist)
-    
     with results_lock:
         safe_json_write(RESULTS_FILE, all_results)
 
 # ============================================================================
-# TELEGRAM NOTIFICATION SYSTEM
+# TELEGRAM MESSAGING
 # ============================================================================
 
 def send_telegram_message(text_content):
-    """Send message to Telegram with proper error handling"""
+    """Send Telegram message"""
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram credentials missing")
         return
@@ -215,29 +215,26 @@ def send_telegram_message(text_content):
                 "text": chunk,
                 "parse_mode": "HTML"
             }
-            response = requests.post(url, data=payload, timeout=15)
-            response.raise_for_status()
+            requests.post(url, data=payload, timeout=15)
         except Exception as e:
-            print(f"Telegram send error: {e}")
+            print(f"Telegram error: {e}")
 
 # ============================================================================
-# KUCOIN API INTEGRATION
+# KUCOIN API
 # ============================================================================
 
 def fetch_current_price(symbol):
-    """Fetch current price from KuCoin API"""
+    """Get current price"""
     try:
         response = requests.get(KUCOIN_PRICE, params={"symbol": symbol}, timeout=10)
-        
         if response.json().get("code") == "200000":
             return float(response.json()["data"].get("price", 0))
-    except Exception as e:
-        print(f"Error fetching price for {symbol}: {e}")
-    
+    except:
+        pass
     return None
 
 def fetch_kline_data(symbol, timeframe="1hour", limit=24):
-    """Fetch candlestick data from KuCoin"""
+    """Get candlestick data"""
     try:
         params = {
             "symbol": symbol,
@@ -245,42 +242,33 @@ def fetch_kline_data(symbol, timeframe="1hour", limit=24):
             "startAt": int(time.time()) - (limit * 3600)
         }
         response = requests.get(KUCOIN_KLINES, params=params, timeout=10)
-        
         if response.json().get("code") == "200000":
             return response.json().get("data", [])
-    except Exception as e:
-        print(f"Error fetching klines for {symbol}: {e}")
-    
+    except:
+        pass
     return []
 
 def detect_support_level(symbol):
-    """Detect support level from 72-hour price history"""
+    """Detect support from 72h history"""
     klines = fetch_kline_data(symbol, "1hour", 72)
-    
     if len(klines) < 3:
         return None
-    
     lows = [float(k[4]) for k in klines]
     support = min(lows[-24:]) if len(lows) >= 24 else min(lows)
-    
     return support
 
 def detect_resistance_level(symbol):
-    """Detect resistance level from 72-hour price history"""
+    """Detect resistance from 72h history"""
     klines = fetch_kline_data(symbol, "1hour", 72)
-    
     if len(klines) < 3:
         return None
-    
     highs = [float(k[3]) for k in klines]
     resistance = max(highs[-24:]) if len(highs) >= 24 else max(highs)
-    
     return resistance
 
 def classify_market_structure(symbol):
-    """Classify market structure: UPTREND, DOWNTREND, or RANGE"""
+    """Classify market structure"""
     klines = fetch_kline_data(symbol, "4hour", 20)
-    
     if len(klines) < 5:
         return "UNKNOWN"
     
@@ -300,39 +288,38 @@ def classify_market_structure(symbol):
         return "RANGE"
 
 # ============================================================================
-# BREAKOUT MOMENTUM ANALYSIS (Layer 4 - Critical Component)
+# BREAKOUT MOMENTUM ANALYSIS (Layer 4)
 # ============================================================================
 
 def analyze_breakout_momentum(symbol):
-    """Analyze if price is ready for breakout (Layer 4)"""
+    """Analyze breakout momentum"""
     klines = fetch_kline_data(symbol, "1hour", 24)
-    
     if len(klines) < 3:
-        return 0, "Insufficient kline data"
+        return 0, "Insufficient data"
     
     closes = [float(k[2]) for k in klines[-12:]]
     volumes = [float(k[5]) for k in klines[-12:]]
     
     if not closes or not volumes:
-        return 0, "No price/volume data"
+        return 0, "No data"
     
     momentum_score = 0
     reasons = []
     
-    # 1. PRICE MOMENTUM CHECK
+    # Price momentum
     if len(closes) >= 6:
         price_change_percent = ((closes[-1] - closes[-6]) / closes[-6]) * 100
         
         if price_change_percent > 2:
             momentum_score += 25
-            reasons.append("Price accelerating upward")
+            reasons.append("Price up")
         elif price_change_percent > 0:
             momentum_score += 15
-            reasons.append("Slight uptrend")
+            reasons.append("Slight up")
         elif price_change_percent < -2:
-            return 0, "Price declining - SKIP entry"
+            return 0, "Price down"
     
-    # 2. VOLUME ACCELERATION CHECK
+    # Volume acceleration
     if len(volumes) >= 12:
         early_volume = sum(volumes[-12:-6]) / 6
         recent_volume = sum(volumes[-6:]) / 6
@@ -342,23 +329,23 @@ def analyze_breakout_momentum(symbol):
             
             if volume_acceleration > 50:
                 momentum_score += 30
-                reasons.append("Volume surging (+50%)")
+                reasons.append("Vol surge")
             elif volume_acceleration > 20:
                 momentum_score += 20
-                reasons.append("Volume building")
+                reasons.append("Vol build")
             elif volume_acceleration < -30:
-                return 0, "Volume declining - SKIP entry"
+                return 0, "Vol down"
     
-    # 3. CONSOLIDATION/COMPRESSION CHECK (setup for breakout)
+    # Compression
     if len(closes) >= 12:
         recent_range = max(closes[-6:]) - min(closes[-6:])
         early_range = max(closes[-12:-6]) - min(closes[-12:-6])
         
         if early_range > 0 and recent_range < (early_range * 0.7):
             momentum_score += 20
-            reasons.append("Price compression forming")
+            reasons.append("Compress")
     
-    final_reason = " | ".join(reasons) if reasons else "No momentum signals"
+    final_reason = " | ".join(reasons) if reasons else "No signals"
     return min(momentum_score, 100), final_reason
 
 # ============================================================================
@@ -366,7 +353,7 @@ def analyze_breakout_momentum(symbol):
 # ============================================================================
 
 def get_consecutive_appearance_bonus(symbol):
-    """Check if coin appears in consecutive scans for higher confidence"""
+    """Check consecutive appearances"""
     with history_lock:
         history = candidate_history.get(symbol, [])
     
@@ -385,17 +372,17 @@ def get_consecutive_appearance_bonus(symbol):
     return 0
 
 def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_symbol, symbol):
-    """Calculate pre-breakout accumulation score (0-100)"""
+    """Calculate accumulation score (0-100)"""
     score = 0
     smart_money_signal = False
     
-    # 1. SIDEWAYS CONSOLIDATION
+    # Sideways consolidation
     if -2 <= price_change <= 5:
         score += 25
     elif 5 < price_change <= 8:
         score += 10
     
-    # 2. VOLUME STRENGTH
+    # Volume strength
     if volume >= 10_000_000:
         score += 25
     elif volume >= 5_000_000:
@@ -403,7 +390,7 @@ def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_s
     elif volume >= 1_000_000:
         score += 12
     
-    # 3. RELATIVE STRENGTH vs BTC
+    # Relative strength
     if rs_vs_btc >= 4:
         score += 20
     elif rs_vs_btc >= 2:
@@ -411,32 +398,32 @@ def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_s
     elif rs_vs_btc >= 0:
         score += 8
     
-    # 4. SECTOR ANALYSIS
+    # Sector analysis
     if sector in HOT_SECTORS:
         score += 15
     elif sector != "Unclassified":
         score += 7
     
-    # 5. CARTEL HISTORICAL MEMORY
+    # Cartel historical
     if base_symbol in CARTEL_HISTORICAL_COINS:
         score += 10
     
-    # 6. SMART MONEY PROXY
+    # Smart money proxy
     if (-1 <= price_change <= 4) and (volume >= 5_000_000):
         score += 10
         smart_money_signal = True
     
-    # 7. SMART MONEY WATCHLIST BOOST
+    # Smart money watchlist
     if base_symbol in SMART_MONEY_WATCHLIST:
         score += 8
     
-    # 8. CONSECUTIVE APPEARANCE BONUS
+    # Consecutive bonus
     score += get_consecutive_appearance_bonus(symbol)
     
     return min(score, 100), smart_money_signal
 
 def classify_score_to_label(score):
-    """Classify score into trading quality label"""
+    """Classify score to label"""
     if score >= 90:
         return "🔥 ELITE PRE-BREAKOUT"
     elif score >= 85:
@@ -447,11 +434,11 @@ def classify_score_to_label(score):
         return "⚠️ MONITOR ONLY"
 
 # ============================================================================
-# WATCHLIST MANAGEMENT (Two-Stage Alerting) - V9.1 UPDATE
+# WATCHLIST MANAGEMENT (Two-Stage Alerting)
 # ============================================================================
 
 def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money):
-    """Add coin to watchlist for monitoring"""
+    """Add to watchlist"""
     with watchlist_lock:
         if symbol not in watchlist:
             watchlist[symbol] = {
@@ -468,7 +455,7 @@ def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money):
     persist_all_state()
 
 def send_watchlist_alert(symbol, price, score, sector, smart_money):
-    """Alert #1: Coin added to watchlist with Entry/TP1/TP2/SL (v9.1)"""
+    """Alert #1: Coin added to watchlist (v9.1 format)"""
     # Calculate estimated entry (at support, ~2% below current)
     estimated_entry = price * 0.98
     tp1 = estimated_entry * (1 + TARGET_1_PERCENT / 100)
@@ -492,7 +479,7 @@ def send_watchlist_alert(symbol, price, score, sector, smart_money):
     send_telegram_message(msg)
 
 def check_watchlist_for_entry_conditions():
-    """Monitor watchlist coins for entry conditions"""
+    """Monitor watchlist for entry"""
     with watchlist_lock:
         symbols_to_check = list(watchlist.keys())
     
@@ -515,17 +502,17 @@ def check_watchlist_for_entry_conditions():
             item["structure"] = classify_market_structure(symbol)
             
             distance_to_support = ((current_price - support) / support) * 100
-            if distance_to_support > 2:
+            if distance_to_support > MAX_SUPPORT_DISTANCE_PERCENT:
                 continue
             
             if MOMENTUM_CHECK_ENABLED:
                 momentum_score, momentum_reason = analyze_breakout_momentum(symbol)
             else:
                 momentum_score = 100
-                momentum_reason = "Momentum check disabled"
+                momentum_reason = "Disabled"
             
             if momentum_score < MIN_MOMENTUM_SCORE:
-                print(f"{symbol}: At support but momentum too weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
+                print(f"{symbol}: At support but momentum weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
                 continue
             
             send_entry_alert(symbol, current_price, item, momentum_score, momentum_reason, support)
@@ -538,10 +525,10 @@ def check_watchlist_for_entry_conditions():
             persist_all_state()
             
         except Exception as e:
-            print(f"Watchlist check error for {symbol}: {e}")
+            print(f"Watchlist error {symbol}: {e}")
 
 def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, momentum_reason, support):
-    """Alert #2: BUY NOW with all confirmations"""
+    """Alert #2: BUY NOW"""
     tp1_price = entry_price * (1 + TARGET_1_PERCENT / 100)
     tp2_price = entry_price * (1 + TARGET_2_PERCENT / 100)
     sl_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
@@ -570,17 +557,16 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
     
     msg += "━━━━━━━━━━━━━━━━━\n"
     msg += "✅ TIME TO BUY\n"
-    msg += "Structure + Price + Momentum = High Probability Entry\n"
-    msg += "Not a guess. All factors aligned. Enter now."
+    msg += "All factors aligned. Enter now."
     
     send_telegram_message(msg)
 
 # ============================================================================
-# POSITION TRACKING & MONITORING
+# POSITION TRACKING
 # ============================================================================
 
 def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", score=0):
-    """Register a position for tracking"""
+    """Register position"""
     tp1 = entry_price * (1 + TARGET_1_PERCENT / 100)
     tp2 = entry_price * (1 + TARGET_2_PERCENT / 100)
     sl = entry_price * (1 - STOP_LOSS_PERCENT / 100)
@@ -602,10 +588,10 @@ def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", sc
         }
     
     persist_all_state()
-    print(f"Position added: {symbol} | Entry: {entry_price} | TP1: {tp1:.5f} | TP2: {tp2:.5f} | SL: {sl:.5f}")
+    print(f"Position: {symbol} @ {entry_price}")
 
 def save_trade_result(symbol, sector, score, entry_price, exit_price, result_type):
-    """Save closed trade to results"""
+    """Save trade result"""
     pnl_percent = ((exit_price - entry_price) / entry_price) * 100
     duration_hours = (time.time() - tracked_positions[symbol]["alerted_at"]) / 3600
     
@@ -625,10 +611,10 @@ def save_trade_result(symbol, sector, score, entry_price, exit_price, result_typ
         all_results.append(trade_record)
     
     persist_all_state()
-    print(f"Trade result saved: {symbol} | {result_type} | {pnl_percent:.2f}%")
+    print(f"Trade: {symbol} {result_type} {pnl_percent:.2f}%")
 
 def monitor_tracked_positions():
-    """Monitor tracked positions for TP1/TP2/SL hits"""
+    """Monitor positions"""
     with positions_lock:
         symbols = list(tracked_positions.keys())
     
@@ -650,14 +636,7 @@ def monitor_tracked_positions():
         if current_time - pos["alerted_at"] > TRACK_MAX_DURATION:
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "EXPIRED")
             
-            msg = f"⏰ <b>TRACKING CLOSED — 48h Expired</b>\n\n"
-            msg += f"<b>{symbol}</b>\n"
-            msg += f"💰 Entry: {format_price_display(pos['entry'])}\n"
-            msg += f"📍 Final: {format_price_display(current_price)} ({format_percentage(change_percent)})\n"
-            msg += f"TP1 Hit: {'✅' if pos['tp1_hit'] else '❌'}\n"
-            msg += f"TP2 Hit: {'✅' if pos['tp2_hit'] else '❌'}\n"
-            msg += f"SL Hit: {'✅' if pos['sl_hit'] else '❌'}"
-            
+            msg = f"⏰ <b>EXPIRED (48h)</b>\n\n<b>{symbol}</b>\n{format_percentage(change_percent)}"
             send_telegram_message(msg)
             to_remove.append(symbol)
             continue
@@ -669,12 +648,7 @@ def monitor_tracked_positions():
             
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "TP2")
             
-            msg = f"🚀 <b>TARGET 2 HIT!</b>\n\n"
-            msg += f"<b>{symbol}</b>\n"
-            msg += f"💰 Entry: {format_price_display(pos['entry'])}\n"
-            msg += f"📍 Exit: {format_price_display(current_price)}\n"
-            msg += f"📈 Profit: {format_percentage(change_percent)} ✅✅✅"
-            
+            msg = f"🚀 <b>TARGET 2 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
             send_telegram_message(msg)
             to_remove.append(symbol)
             continue
@@ -685,13 +659,7 @@ def monitor_tracked_positions():
             
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "TP1")
             
-            msg = f"✅ <b>TARGET 1 HIT!</b>\n\n"
-            msg += f"<b>{symbol}</b>\n"
-            msg += f"💰 Entry: {format_price_display(pos['entry'])}\n"
-            msg += f"📍 Current: {format_price_display(current_price)}\n"
-            msg += f"📈 Profit: {format_percentage(change_percent)} ✅\n\n"
-            msg += "Still tracking for TP2..."
-            
+            msg = f"✅ <b>TARGET 1 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
             send_telegram_message(msg)
         
         elif current_price <= pos["sl"] and not pos["sl_hit"]:
@@ -701,12 +669,7 @@ def monitor_tracked_positions():
             
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "SL")
             
-            msg = f"🛑 <b>STOP LOSS HIT</b>\n\n"
-            msg += f"<b>{symbol}</b>\n"
-            msg += f"💰 Entry: {format_price_display(pos['entry'])}\n"
-            msg += f"📍 Exit: {format_price_display(current_price)}\n"
-            msg += f"📉 Loss: {format_percentage(change_percent)} ❌"
-            
+            msg = f"🛑 <b>STOP LOSS</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
             send_telegram_message(msg)
             to_remove.append(symbol)
     
@@ -718,7 +681,7 @@ def monitor_tracked_positions():
     persist_all_state()
 
 # ============================================================================
-# RESULTS REPORTING & ANALYTICS
+# RESULTS REPORTING
 # ============================================================================
 
 def generate_performance_report(days=None):
@@ -764,7 +727,7 @@ def generate_performance_report(days=None):
     return msg
 
 # ============================================================================
-# TELEGRAM COMMAND HANDLER
+# TELEGRAM COMMANDS
 # ============================================================================
 
 def handle_telegram_command(command_text):
@@ -773,13 +736,10 @@ def handle_telegram_command(command_text):
     
     if cmd == "/results":
         send_telegram_message(generate_performance_report())
-    
     elif cmd == "/results7":
         send_telegram_message(generate_performance_report(days=7))
-    
     elif cmd == "/results30":
         send_telegram_message(generate_performance_report(days=30))
-    
     elif cmd == "/positions":
         with positions_lock:
             active_positions = {s: p for s, p in tracked_positions.items() if not p["closed"]}
@@ -798,11 +758,9 @@ def handle_telegram_command(command_text):
             msg += f"💰 Entry: {format_price_display(pos['entry'])}\n"
             msg += f"📍 Current: {format_price_display(current) if current else 'N/A'} ({format_percentage(change)})\n"
             msg += f"🎯 TP1: {format_price_display(pos['tp1'])}  TP2: {format_price_display(pos['tp2'])}\n"
-            msg += f"🛑 SL: {format_price_display(pos['sl'])}\n"
-            msg += f"Status: {'TP1 ✅' if pos['tp1_hit'] else 'Tracking'}\n\n"
+            msg += f"🛑 SL: {format_price_display(pos['sl'])}\n\n"
         
         send_telegram_message(msg)
-    
     elif cmd == "/status":
         with positions_lock:
             active_count = sum(1 for p in tracked_positions.values() if not p["closed"])
@@ -822,25 +780,23 @@ def handle_telegram_command(command_text):
         msg += f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%"
         
         send_telegram_message(msg)
-    
     elif cmd == "/help":
         msg = "🤖 <b>Inshal Crypto Scanner v9.1 Commands</b>\n\n"
-        msg += "/results — All-time performance\n"
+        msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
-        msg += "/positions — Active tracked coins\n"
-        msg += "/status — Scanner health status\n"
+        msg += "/positions — Active trades\n"
+        msg += "/status — Health check\n"
         msg += "/help — This message"
         
         send_telegram_message(msg)
 
 def telegram_listener_thread():
-    """Background thread for Telegram command listener"""
+    """Telegram listener"""
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing - listener disabled")
         return
     
-    print("Telegram command listener started")
+    print("Telegram listener started")
     last_update_id = 0
     
     while not shutdown_flag.is_set():
@@ -858,15 +814,10 @@ def telegram_listener_thread():
                 chat_id = str(message.get("chat", {}).get("id", ""))
                 
                 if chat_id == str(CHAT_ID) and text.startswith("/"):
-                    print(f"Telegram command received: {text}")
+                    print(f"Command: {text}")
                     handle_telegram_command(text)
-        
-        except requests.exceptions.Timeout:
+        except:
             pass
-        except Exception as e:
-            print(f"Telegram listener error: {e}")
-            time.sleep(10)
-            continue
         
         time.sleep(10)
 
@@ -875,7 +826,7 @@ def telegram_listener_thread():
 # ============================================================================
 
 def fetch_market_data():
-    """Fetch all ticker data from KuCoin"""
+    """Fetch market data"""
     response = requests.get(KUCOIN_TICKERS, timeout=20)
     
     if response.json().get("code") != "200000":
@@ -884,7 +835,7 @@ def fetch_market_data():
     return response.json()["data"]["ticker"]
 
 def prepare_market_data(ticker_data):
-    """Convert ticker data to usable format"""
+    """Prepare market data"""
     market = {}
     
     for coin in ticker_data:
@@ -905,7 +856,7 @@ def prepare_market_data(ticker_data):
     return market
 
 def execute_market_scan():
-    """Execute one full market scan"""
+    """Execute market scan"""
     global scan_count
     
     with scan_lock:
@@ -965,7 +916,7 @@ def execute_market_scan():
     
     persist_all_state()
     
-    print(f"Scan #{current_scan} | BTC: {btc_change:.2f}% | Candidates: {len(top_candidates)}")
+    print(f"Scan #{current_scan} | Candidates: {len(top_candidates)}")
     
     strict_candidates = [c for c in top_candidates if c["score"] >= STRICT_SCORE_THRESHOLD]
     
@@ -991,31 +942,29 @@ def scanner_main_loop():
     
     send_telegram_message(
         "🟢 <b>Inshal Crypto Scanner v9.1 — STARTED</b>\n\n"
-        "✅ Two-Stage Alerting System Active\n"
+        "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
-        "⚡ Breakout Momentum Detection Enabled\n"
-        f"📏 Momentum Threshold: {MIN_MOMENTUM_SCORE}/100\n"
+        "⚡ Breakout Momentum Detection (≥70/100)\n"
         f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%\n\n"
-        "<b>v9.1 UPDATE:</b>\n"
-        "Watchlist alerts now show Entry/TP1/TP2/SL\n"
-        "instead of strategy explanation\n\n"
-        "95% accuracy target active. In Sha Allah. 🚀"
+        "<b>v9.1 STRICT MODE:</b>\n"
+        "High quality trades only\n"
+        "Fewer alerts = Higher accuracy\n\n"
+        "95% accuracy target. In Sha Allah. 🚀"
     )
     
-    print("Scanner main loop started")
+    print("Scanner loop started")
     consecutive_errors = 0
     
     while not shutdown_flag.is_set():
         try:
             execute_market_scan()
             consecutive_errors = 0
-        
         except Exception as e:
             consecutive_errors += 1
             print(f"Scan error ({consecutive_errors}x): {e}")
             
             if consecutive_errors % 4 == 0:
-                send_telegram_message(f"⚠️ <b>Scanner Error</b>\n\n{str(e)[:100]}\n\nRetrying...")
+                send_telegram_message(f"⚠️ Error: {str(e)[:100]}")
             
             time.sleep(300)
             continue
@@ -1023,7 +972,7 @@ def scanner_main_loop():
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 def tracking_main_loop():
-    """Background loop for position tracking"""
+    """Tracking loop"""
     print("Tracking loop started")
     
     while not shutdown_flag.is_set():
@@ -1036,14 +985,12 @@ def tracking_main_loop():
         time.sleep(TRACK_CHECK_INTERVAL)
 
 def handle_sigterm_signal(signum, frame):
-    """Handle SIGTERM gracefully"""
+    """Handle shutdown"""
     shutdown_flag.set()
     
     send_telegram_message(
         f"🔴 <b>Inshal Crypto Scanner v9.1 — STOPPED</b>\n\n"
-        f"Reason: SIGTERM signal received\n"
-        f"Total scans completed: {scan_count}\n"
-        f"Scanner is now offline."
+        f"Total scans: {scan_count}"
     )
     
     sys.exit(0)
@@ -1076,13 +1023,13 @@ def route_health():
             threading.Thread(target=tracking_main_loop, daemon=True).start()
             threading.Thread(target=telegram_listener_thread, daemon=True).start()
             
-            print("✅ All background threads started")
+            print("✅ All threads started")
     
     return "OK"
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test message from v9.1")
+    send_telegram_message("🧪 Test from v9.1")
     return "Test sent"
 
 @app.route("/scan")
@@ -1115,7 +1062,8 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.1"
+        "version": "9.1",
+        "mode": "STRICT"
     })
 
 # ============================================================================
