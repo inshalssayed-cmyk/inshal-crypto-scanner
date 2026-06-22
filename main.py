@@ -9,10 +9,10 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.1 (STRICT MODE - PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.2 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
-# v9.1: Watchlist alerts show Entry/TP1/TP2/SL (clean format)
+# v9.2: Brooks price-action entry, fixed entry trigger, 4%/8% targets, seen counter
 # STRICT MODE: High quality trades only
 # ============================================================================
 
@@ -45,10 +45,20 @@ SCAN_INTERVAL_SECONDS = 900  # 15 minutes
 TRACK_CHECK_INTERVAL = 180   # 3 minutes
 TRACK_MAX_DURATION = 48 * 3600  # 48 hours
 
-# Position Settings (TP/SL locked)
-TARGET_1_PERCENT = 6.0
-TARGET_2_PERCENT = 12.0
+# Position Settings (TP/SL)
+TARGET_1_PERCENT = 4.0   # v9.2: lowered from 6.0
+TARGET_2_PERCENT = 8.0   # v9.2: lowered from 12.0
 STOP_LOSS_PERCENT = 5.0
+
+# v9.2 Brooks-based entry engine
+# Entry is derived from the recent swing-low (range bottom), not a flat % discount.
+# A small buffer is placed ABOVE the swing low so the order fills just above support
+# (Brooks: bulls buy just above the bottom of the trading range, not exactly at it).
+SWING_LOOKBACK_HOURS = 48          # window used to locate the range/swing low
+ENTRY_BUFFER_ABOVE_SUPPORT = 0.4   # % above the swing low to place entry
+ENTRY_FILL_TOLERANCE = 0.5         # % band around entry that counts as "price reached entry"
+ENTRY_MAX_DISCOUNT = 6.0           # safety cap: entry never more than this % below current
+ENTRY_MIN_DISCOUNT = 0.2           # safety floor: entry at least this % below current
 
 # Breakout Momentum Detection (Layer 4) - STRICT MODE
 MOMENTUM_CHECK_ENABLED = True
@@ -63,6 +73,7 @@ HISTORY_FILE = "./scan_history.json"
 POSITIONS_FILE = "./positions.json"
 RESULTS_FILE = "./results.json"
 WATCHLIST_FILE = "./watchlist.json"
+SEEN_COUNTS_FILE = "./seen_counts.json"
 
 # ============================================================================
 # GLOBAL STATE
@@ -76,6 +87,10 @@ alerted_lock = threading.Lock()
 
 candidate_history = {}
 history_lock = threading.Lock()
+
+# v9.2: how many times each coin has appeared as a scan candidate
+seen_counts = {}
+seen_lock = threading.Lock()
 
 tracked_positions = {}
 positions_lock = threading.Lock()
@@ -168,7 +183,7 @@ def safe_json_write(filepath, data):
 
 def load_persistent_state():
     """Load state from disk"""
-    global candidate_history, tracked_positions, watchlist, all_results
+    global candidate_history, tracked_positions, watchlist, all_results, seen_counts
     
     with history_lock:
         candidate_history = safe_json_read(HISTORY_FILE, {})
@@ -182,6 +197,9 @@ def load_persistent_state():
     with results_lock:
         all_results = safe_json_read(RESULTS_FILE, [])
     
+    with seen_lock:
+        seen_counts = safe_json_read(SEEN_COUNTS_FILE, {})
+    
     print(f"✅ State loaded")
 
 def persist_all_state():
@@ -194,6 +212,8 @@ def persist_all_state():
         safe_json_write(WATCHLIST_FILE, watchlist)
     with results_lock:
         safe_json_write(RESULTS_FILE, all_results)
+    with seen_lock:
+        safe_json_write(SEEN_COUNTS_FILE, seen_counts)
 
 # ============================================================================
 # TELEGRAM MESSAGING
@@ -265,6 +285,60 @@ def detect_resistance_level(symbol):
     highs = [float(k[3]) for k in klines]
     resistance = max(highs[-24:]) if len(highs) >= 24 else max(highs)
     return resistance
+
+def calculate_brooks_entry(symbol, current_price):
+    """
+    v9.2 — Derive entry from price-action structure (Al Brooks method),
+    not a flat percentage discount.
+
+    Brooks: in a trading range, bulls buy just ABOVE the bottom of the range
+    (the recent swing low / support magnet). So the entry is the recent swing
+    low plus a small buffer, clamped to sane limits relative to current price.
+
+    Returns dict: entry, swing_low, range_high, range_pct, basis
+    or None if data unavailable.
+    """
+    klines = fetch_kline_data(symbol, "1hour", SWING_LOOKBACK_HOURS)
+    if len(klines) < 6:
+        return None
+
+    lows = [float(k[4]) for k in klines]
+    highs = [float(k[3]) for k in klines]
+
+    # Range bottom (support magnet) and range top over the lookback window
+    swing_low = min(lows)
+    range_high = max(highs)
+
+    if swing_low <= 0:
+        return None
+
+    # Brooks entry: just above the swing low (buy near the bottom of the range)
+    entry = swing_low * (1 + ENTRY_BUFFER_ABOVE_SUPPORT / 100)
+
+    # Clamp so the entry is realistic vs current price
+    max_entry = current_price * (1 - ENTRY_MIN_DISCOUNT / 100)   # at least slightly below current
+    min_entry = current_price * (1 - ENTRY_MAX_DISCOUNT / 100)   # never absurdly far below
+
+    basis = "swing-low + buffer"
+    if entry > max_entry:
+        # Price already coiling right at support -> entry sits just under current
+        entry = max_entry
+        basis = "tight range near support"
+    if entry < min_entry:
+        # Swing low is very deep -> cap the discount
+        entry = min_entry
+        basis = "deep swing-low (capped)"
+
+    range_pct = ((range_high - swing_low) / swing_low) * 100 if swing_low else 0
+
+    return {
+        "entry": entry,
+        "swing_low": swing_low,
+        "range_high": range_high,
+        "range_pct": range_pct,
+        "basis": basis
+    }
+
 
 def classify_market_structure(symbol):
     """Classify market structure"""
@@ -371,6 +445,17 @@ def get_consecutive_appearance_bonus(symbol):
     
     return 0
 
+def increment_seen_count(symbol):
+    """v9.2: Increment how many times a coin has appeared as a candidate."""
+    with seen_lock:
+        seen_counts[symbol] = seen_counts.get(symbol, 0) + 1
+        return seen_counts[symbol]
+
+def get_seen_count(symbol):
+    """v9.2: Read how many times a coin has appeared."""
+    with seen_lock:
+        return seen_counts.get(symbol, 0)
+
 def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_symbol, symbol):
     """Calculate accumulation score (0-100)"""
     score = 0
@@ -437,74 +522,98 @@ def classify_score_to_label(score):
 # WATCHLIST MANAGEMENT (Two-Stage Alerting)
 # ============================================================================
 
-def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money):
-    """Add to watchlist"""
+def add_coin_to_watchlist(symbol, current_price, score, sector, smart_money, plan=None, seen=1):
+    """Add to watchlist with a Brooks-based entry plan (v9.2)."""
     with watchlist_lock:
         if symbol not in watchlist:
+            entry = plan["entry"] if plan else current_price * 0.99
+            tp1 = entry * (1 + TARGET_1_PERCENT / 100)
+            tp2 = entry * (1 + TARGET_2_PERCENT / 100)
+            sl = entry * (1 - STOP_LOSS_PERCENT / 100)
             watchlist[symbol] = {
                 "added_at": time.time(),
                 "score": score,
-                "entry_price": current_price,
+                "added_price": current_price,
+                "planned_entry": entry,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": sl,
                 "sector": sector,
                 "smart_money": smart_money,
-                "support": None,
-                "resistance": None,
+                "seen": seen,
+                "swing_low": plan["swing_low"] if plan else None,
+                "range_high": plan["range_high"] if plan else None,
+                "basis": plan["basis"] if plan else "fallback",
                 "structure": "UNKNOWN"
             }
     
     persist_all_state()
 
-def send_watchlist_alert(symbol, price, score, sector, smart_money):
-    """Alert #1: Coin added to watchlist (v9.1 format)"""
-    # Calculate estimated entry (at support, ~2% below current)
-    estimated_entry = price * 0.98
-    tp1 = estimated_entry * (1 + TARGET_1_PERCENT / 100)
-    tp2 = estimated_entry * (1 + TARGET_2_PERCENT / 100)
-    sl = estimated_entry * (1 - STOP_LOSS_PERCENT / 100)
-    
+def send_watchlist_alert(symbol, price, score, sector, smart_money, plan=None, seen=1):
+    """Alert #1: Coin added to watchlist (v9.2 — Brooks entry + seen counter)."""
+    if plan:
+        entry = plan["entry"]
+        basis = plan["basis"]
+        swing_low = plan["swing_low"]
+    else:
+        entry = price * 0.99
+        basis = "fallback"
+        swing_low = None
+
+    tp1 = entry * (1 + TARGET_1_PERCENT / 100)
+    tp2 = entry * (1 + TARGET_2_PERCENT / 100)
+    sl = entry * (1 - STOP_LOSS_PERCENT / 100)
+    discount = ((price - entry) / price) * 100 if price else 0
+
     msg = "🔍 <b>COIN ADDED TO WATCHLIST</b>\n\n"
     msg += f"<b>{symbol}</b>\n"
     msg += "━━━━━━━━━━━━━━━━━\n"
     msg += f"⭐ Score: {score}/100 {classify_score_to_label(score)}\n"
+    msg += f"🔁 Times Seen: {seen}\n"
     msg += f"💰 Current Price: {format_price_display(price)}\n"
     msg += f"🧩 Sector: {sector}\n\n"
-    msg += "<b>ESTIMATED TARGETS:</b>\n"
-    msg += f"💰 Entry: {format_price_display(estimated_entry)}\n"
+    msg += "<b>ENTRY PLAN (Price-Action):</b>\n"
+    msg += f"💰 Entry: {format_price_display(entry)}  ({discount:.1f}% below)\n"
+    if swing_low:
+        msg += f"📐 Basis: {basis} (swing low {format_price_display(swing_low)})\n"
+    else:
+        msg += f"📐 Basis: {basis}\n"
     msg += f"🎯 TP1: {format_price_display(tp1)} (+{TARGET_1_PERCENT:.0f}%)\n"
     msg += f"🎯 TP2: {format_price_display(tp2)} (+{TARGET_2_PERCENT:.0f}%)\n"
     msg += f"🛑 SL: {format_price_display(sl)} (-{STOP_LOSS_PERCENT:.0f}%)\n\n"
     msg += "⏰ STATUS: MONITORING\n"
-    msg += "Waiting for support + momentum confirmation... ✅"
+    msg += "Will fire BUY when price reaches entry + momentum confirms. ✅"
     
     send_telegram_message(msg)
 
 def check_watchlist_for_entry_conditions():
-    """Monitor watchlist for entry"""
+    """Monitor watchlist — fire BUY when price reaches the PLANNED entry (v9.2)."""
     with watchlist_lock:
         symbols_to_check = list(watchlist.keys())
     
     for symbol in symbols_to_check:
         try:
-            item = watchlist[symbol]
+            with watchlist_lock:
+                item = dict(watchlist[symbol])
             current_price = fetch_current_price(symbol)
             
             if not current_price:
                 continue
             
-            support = detect_support_level(symbol)
-            resistance = detect_resistance_level(symbol)
-            
-            if not support:
+            planned_entry = item.get("planned_entry")
+            if not planned_entry:
                 continue
             
-            item["support"] = support
-            item["resistance"] = resistance
             item["structure"] = classify_market_structure(symbol)
             
-            distance_to_support = ((current_price - support) / support) * 100
-            if distance_to_support > MAX_SUPPORT_DISTANCE_PERCENT:
+            # v9.2 FIX: trigger is tied to the published entry price.
+            # Fire when the live price has come down into the entry band.
+            entry_band_high = planned_entry * (1 + ENTRY_FILL_TOLERANCE / 100)
+            if current_price > entry_band_high:
+                # price hasn't reached the planned entry yet
                 continue
             
+            # Price is at/below entry. Confirm momentum is not collapsing.
             if MOMENTUM_CHECK_ENABLED:
                 momentum_score, momentum_reason = analyze_breakout_momentum(symbol)
             else:
@@ -512,15 +621,23 @@ def check_watchlist_for_entry_conditions():
                 momentum_reason = "Disabled"
             
             if momentum_score < MIN_MOMENTUM_SCORE:
-                print(f"{symbol}: At support but momentum weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
+                print(f"{symbol}: reached entry but momentum weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
                 continue
             
-            send_entry_alert(symbol, current_price, item, momentum_score, momentum_reason, support)
-            
-            add_position_for_tracking(symbol, current_price, scan_count, item["sector"], item["score"])
+            # Enter at the planned entry (or current if it gapped below)
+            fill_price = min(current_price, planned_entry)
             
             with watchlist_lock:
-                del watchlist[symbol]
+                item.update(watchlist.get(symbol, {}))
+            
+            send_entry_alert(symbol, fill_price, item, momentum_score, momentum_reason,
+                             item.get("swing_low") or planned_entry)
+            
+            add_position_for_tracking(symbol, fill_price, scan_count, item["sector"], item["score"])
+            
+            with watchlist_lock:
+                if symbol in watchlist:
+                    del watchlist[symbol]
             
             persist_all_state()
             
@@ -553,6 +670,7 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
     
     msg += f"⚖️ Risk/Reward: 1:{rr_ratio:.1f}\n"
     msg += f"📊 Win Probability: 95%\n"
+    msg += f"🔁 Times Seen: {watchlist_item.get('seen', 1)}\n"
     msg += f"⭐ Score: {watchlist_item['score']}/100\n\n"
     
     msg += "━━━━━━━━━━━━━━━━━\n"
@@ -769,7 +887,7 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9.1 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.2 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
@@ -781,7 +899,7 @@ def handle_telegram_command(command_text):
         
         send_telegram_message(msg)
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9.1 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.2 Commands</b>\n\n"
         msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -914,6 +1032,13 @@ def execute_market_scan():
                 lst.append({"ts": time.time(), "score": c["score"]})
                 candidate_history[c["symbol"]] = lst[-20:]
     
+    # v9.2: bump the appearance counter for every qualifying candidate this scan
+    for c in top_candidates:
+        if c["score"] >= 65:
+            c["seen"] = increment_seen_count(c["symbol"])
+        else:
+            c["seen"] = get_seen_count(c["symbol"])
+    
     persist_all_state()
     
     print(f"Scan #{current_scan} | Candidates: {len(top_candidates)}")
@@ -933,22 +1058,27 @@ def execute_market_scan():
                 last_alerted[c["symbol"]] = time.time()
     
     for c in new_alerts:
-        send_watchlist_alert(c["symbol"], c["price"], c["score"], c["sector"], c["smart"])
-        add_coin_to_watchlist(c["symbol"], c["price"], c["score"], c["sector"], c["smart"])
+        plan = calculate_brooks_entry(c["symbol"], c["price"])
+        seen = c.get("seen", get_seen_count(c["symbol"]))
+        send_watchlist_alert(c["symbol"], c["price"], c["score"], c["sector"], c["smart"], plan, seen)
+        add_coin_to_watchlist(c["symbol"], c["price"], c["score"], c["sector"], c["smart"], plan, seen)
 
 def scanner_main_loop():
     """Main scanner loop"""
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9.1 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.2 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Breakout Momentum Detection (≥70/100)\n"
+        "📐 Brooks Price-Action Entry Engine\n"
         f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%\n\n"
-        "<b>v9.1 STRICT MODE:</b>\n"
-        "High quality trades only\n"
-        "Fewer alerts = Higher accuracy\n\n"
+        "<b>v9.2 CHANGES:</b>\n"
+        "• Entry derived from swing-low / range bottom\n"
+        "• BUY fires when price reaches the planned entry\n"
+        "• TP1 4% / TP2 8%\n"
+        "• 🔁 Times-Seen counter per coin\n\n"
         "95% accuracy target. In Sha Allah. 🚀"
     )
     
@@ -989,7 +1119,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9.1 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.2 — STOPPED</b>\n\n"
         f"Total scans: {scan_count}"
     )
     
@@ -1008,7 +1138,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9.1 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.2 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1029,7 +1159,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test from v9.1")
+    send_telegram_message("🧪 Test from v9.2")
     return "Test sent"
 
 @app.route("/scan")
@@ -1062,7 +1192,7 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.1",
+        "version": "9.2",
         "mode": "STRICT"
     })
 
