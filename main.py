@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.2 (STRICT MODE - PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.2.1 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
 # v9.2: Brooks price-action entry, fixed entry trigger, 4%/8% targets, seen counter
@@ -587,7 +587,14 @@ def send_watchlist_alert(symbol, price, score, sector, smart_money, plan=None, s
     send_telegram_message(msg)
 
 def check_watchlist_for_entry_conditions():
-    """Monitor watchlist — fire BUY when price reaches the PLANNED entry (v9.2)."""
+    """Monitor watchlist — fire BUY when price has TOUCHED the planned entry.
+
+    v9.2.1 changes:
+      • Fill is detected from the recent candle LOW, not just the live price,
+        so dips between 3-min checks are not missed.
+      • Momentum gate removed from entry (the coin already passed momentum at
+        selection time; re-checking it here was blocking real fills).
+    """
     with watchlist_lock:
         symbols_to_check = list(watchlist.keys())
     
@@ -595,42 +602,50 @@ def check_watchlist_for_entry_conditions():
         try:
             with watchlist_lock:
                 item = dict(watchlist[symbol])
-            current_price = fetch_current_price(symbol)
-            
-            if not current_price:
-                continue
             
             planned_entry = item.get("planned_entry")
             if not planned_entry:
                 continue
             
-            item["structure"] = classify_market_structure(symbol)
-            
-            # v9.2 FIX: trigger is tied to the published entry price.
-            # Fire when the live price has come down into the entry band.
             entry_band_high = planned_entry * (1 + ENTRY_FILL_TOLERANCE / 100)
-            if current_price > entry_band_high:
-                # price hasn't reached the planned entry yet
+            added_at = item.get("added_at", 0)
+            
+            # Look at recent candles to see if price dipped into the entry band
+            # at any point since the coin was added (catches wicks between checks).
+            touched = False
+            fill_price = None
+            klines = fetch_kline_data(symbol, "15min", 16)
+            if klines:
+                # Only consider candles at/after the coin was added, but never
+                # let an old added_at blank out the whole window — if everything
+                # would be filtered, fall back to the full recent window.
+                usable = [k for k in klines if int(k[0]) >= added_at - 900]
+                if not usable:
+                    usable = klines
+                for k in usable:
+                    # KuCoin kline: [time, open, close, high, low, volume, turnover]
+                    k_low = float(k[4])
+                    if k_low <= entry_band_high:
+                        touched = True
+                        fill_price = min(planned_entry, k_low) if k_low < planned_entry else planned_entry
+                        break
+            
+            # Fallback: also check the live price directly
+            if not touched:
+                current_price = fetch_current_price(symbol)
+                if current_price and current_price <= entry_band_high:
+                    touched = True
+                    fill_price = min(current_price, planned_entry)
+            
+            if not touched:
                 continue
             
-            # Price is at/below entry. Confirm momentum is not collapsing.
-            if MOMENTUM_CHECK_ENABLED:
-                momentum_score, momentum_reason = analyze_breakout_momentum(symbol)
-            else:
-                momentum_score = 100
-                momentum_reason = "Disabled"
-            
-            if momentum_score < MIN_MOMENTUM_SCORE:
-                print(f"{symbol}: reached entry but momentum weak ({momentum_score}/{MIN_MOMENTUM_SCORE})")
-                continue
-            
-            # Enter at the planned entry (or current if it gapped below)
-            fill_price = min(current_price, planned_entry)
+            item["structure"] = classify_market_structure(symbol)
             
             with watchlist_lock:
                 item.update(watchlist.get(symbol, {}))
             
-            send_entry_alert(symbol, fill_price, item, momentum_score, momentum_reason,
+            send_entry_alert(symbol, fill_price, item, None, "entry touched",
                              item.get("swing_low") or planned_entry)
             
             add_position_for_tracking(symbol, fill_price, scan_count, item["sector"], item["score"])
@@ -659,10 +674,11 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
     msg += f"🧩 Sector: {watchlist_item['sector']}\n\n"
     
     msg += "<b>STRUCTURE CONFIRMATION:</b>\n"
-    msg += f"✅ Price at support\n"
+    msg += f"✅ Price reached planned entry\n"
     msg += f"✅ Market Structure: {watchlist_item['structure']}\n"
-    msg += f"✅ Momentum: {momentum_score}/100 ({momentum_reason})\n"
-    msg += f"✅ Confluence: 5/5 factors aligned\n\n"
+    if momentum_score is not None:
+        msg += f"✅ Momentum: {momentum_score}/100 ({momentum_reason})\n"
+    msg += f"✅ Entry basis: {watchlist_item.get('basis', 'swing-low')}\n\n"
     
     msg += f"🎯 TARGET 1:  {format_price_display(tp1_price)}  (+{TARGET_1_PERCENT:.0f}%)\n"
     msg += f"🎯 TARGET 2:  {format_price_display(tp2_price)}  (+{TARGET_2_PERCENT:.0f}%)\n"
@@ -887,7 +903,7 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9.2 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.1 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
@@ -899,7 +915,7 @@ def handle_telegram_command(command_text):
         
         send_telegram_message(msg)
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9.2 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.2.1 Commands</b>\n\n"
         msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -1068,7 +1084,7 @@ def scanner_main_loop():
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9.2 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.2.1 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Breakout Momentum Detection (≥70/100)\n"
@@ -1119,7 +1135,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9.2 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.2.1 — STOPPED</b>\n\n"
         f"Total scans: {scan_count}"
     )
     
@@ -1138,7 +1154,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9.2 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.2.1 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1159,7 +1175,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test from v9.2")
+    send_telegram_message("🧪 Test from v9.2.1")
     return "Test sent"
 
 @app.route("/scan")
@@ -1192,7 +1208,7 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.2",
+        "version": "9.2.1",
         "mode": "STRICT"
     })
 
