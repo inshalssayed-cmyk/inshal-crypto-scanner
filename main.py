@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.2.1 (STRICT MODE - PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.2.3 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
 # v9.2: Brooks price-action entry, fixed entry trigger, 4%/8% targets, seen counter
@@ -67,6 +67,12 @@ MOMENTUM_ANALYSIS_HOURS = 2
 
 # Support Entry Distance - STRICT MODE
 MAX_SUPPORT_DISTANCE_PERCENT = 2.0  # STRICT: Tight entry zone
+
+# v9.2.3: 120-hour accumulation-quality bonus
+# Reads 5 days of 1h candles for top candidates only and awards up to +10
+# for a genuine multi-day base (tight range, holding up, no prior blow-off).
+ACCUM_LOOKBACK_HOURS = 120
+ACCUM_MAX_BONUS = 10
 
 # File Storage
 HISTORY_FILE = "./scan_history.json"
@@ -131,6 +137,19 @@ SECTOR_MAP = {
 }
 
 HOT_SECTORS = {"Gaming", "Solana DeFi", "Solana", "Layer 2", "DeFi", "AI/Privacy", "Privacy/AI"}
+
+# v9.2.2: keyword-based hot-sector matching so label variants (e.g. "Solana NFT")
+# still earn the hot-sector bonus instead of silently dropping to the generic +7.
+HOT_SECTOR_KEYWORDS = ("solana", "gaming", "defi", "layer 2", "l2", "ai", "privacy")
+
+def is_hot_sector(sector):
+    """True if the sector matches any hot-sector family by keyword."""
+    if not sector:
+        return False
+    s = sector.lower()
+    if sector in HOT_SECTORS:
+        return True
+    return any(kw in s for kw in HOT_SECTOR_KEYWORDS)
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -422,6 +441,71 @@ def analyze_breakout_momentum(symbol):
     final_reason = " | ".join(reasons) if reasons else "No signals"
     return min(momentum_score, 100), final_reason
 
+def analyze_accumulation_quality(symbol):
+    """
+    v9.2.3 — Judge multi-day accumulation quality over 120h (5 days).
+    Returns (bonus 0..ACCUM_MAX_BONUS, reason). Only called for top candidates.
+
+    Rewards a genuine base:
+      • Tight 5-day range (not wildly volatile)        -> up to +4
+      • Price holding in upper half of the range       -> up to +3
+      • No prior blow-off pump inside the window        -> up to +3
+    """
+    klines = fetch_kline_data(symbol, "1hour", ACCUM_LOOKBACK_HOURS)
+    if len(klines) < 24:
+        return 0, "insufficient 5d data"
+
+    closes = [float(k[2]) for k in klines]
+    highs = [float(k[3]) for k in klines]
+    lows = [float(k[4]) for k in klines]
+
+    hi = max(highs)
+    lo = min(lows)
+    last = closes[-1]
+    if lo <= 0 or hi <= lo:
+        return 0, "flat/no range"
+
+    bonus = 0
+    reasons = []
+
+    # 1) Tight base: total 5-day range as % of price
+    range_pct = (hi - lo) / lo * 100
+    if range_pct <= 15:
+        bonus += 4
+        reasons.append("tight base")
+    elif range_pct <= 30:
+        bonus += 2
+        reasons.append("moderate base")
+    # very wide (>30%) earns nothing
+
+    # 2) Holding up: where price sits within the 5-day range (0=low,1=high)
+    position = (last - lo) / (hi - lo)
+    if position >= 0.5:
+        bonus += 3
+        reasons.append("upper half")
+    elif position >= 0.33:
+        bonus += 1
+        reasons.append("mid range")
+    # bleeding near the lows earns nothing
+
+    # 3) No prior blow-off: biggest single-hour jump inside the window
+    max_jump = 0
+    for i in range(1, len(closes)):
+        if closes[i-1] > 0:
+            jump = (closes[i] - closes[i-1]) / closes[i-1] * 100
+            if jump > max_jump:
+                max_jump = jump
+    if max_jump < 12:
+        bonus += 3
+        reasons.append("no blow-off")
+    elif max_jump < 20:
+        bonus += 1
+        reasons.append("mild spike")
+    # already-pumped (>=20% hourly) earns nothing
+
+    bonus = min(bonus, ACCUM_MAX_BONUS)
+    return bonus, " | ".join(reasons) if reasons else "weak base"
+
 # ============================================================================
 # ACCUMULATION SCORING ENGINE
 # ============================================================================
@@ -483,8 +567,8 @@ def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_s
     elif rs_vs_btc >= 0:
         score += 8
     
-    # Sector analysis
-    if sector in HOT_SECTORS:
+    # Sector analysis (v9.2.2: keyword match so "Solana NFT" etc. still count)
+    if is_hot_sector(sector):
         score += 15
     elif sector != "Unclassified":
         score += 7
@@ -819,7 +903,7 @@ def monitor_tracked_positions():
 # ============================================================================
 
 def generate_performance_report(days=None):
-    """Generate performance report"""
+    """Generate performance report with per-trade detail (v9.2.3)."""
     with results_lock:
         all_trades = all_results[:]
     
@@ -841,11 +925,16 @@ def generate_performance_report(days=None):
     tp1_trades = [r for r in trades if r["result"] == "TP1"]
     tp2_trades = [r for r in trades if r["result"] == "TP2"]
     sl_trades = [r for r in trades if r["result"] == "SL"]
+    expired_trades = [r for r in trades if r["result"] == "EXPIRED"]
     
     winning_trades = tp1_trades + tp2_trades
     win_rate = (len(winning_trades) / total_trades * 100) if total_trades else 0
     avg_win = (sum(r["pnl_percent"] for r in winning_trades) / len(winning_trades)) if winning_trades else 0
     avg_loss = (sum(r["pnl_percent"] for r in sl_trades) / len(sl_trades)) if sl_trades else 0
+    
+    # Icon per result type
+    icon = {"TP2": "🚀", "TP1": "✅", "SL": "🛑", "EXPIRED": "⏰"}
+    label = {"TP2": "TP2", "TP1": "TP1", "SL": "SL", "EXPIRED": "Expired"}
     
     msg = f"📊 <b>Scanner Performance Report</b>\n"
     msg += f"🗓 {period_label} | {total_trades} trade(s)\n"
@@ -853,10 +942,21 @@ def generate_performance_report(days=None):
     msg += f"🚀 TP2 Hit:    {len(tp2_trades):>3}  ({len(tp2_trades)/total_trades*100:.1f}%)\n"
     msg += f"✅ TP1 Hit:    {len(tp1_trades):>3}  ({len(tp1_trades)/total_trades*100:.1f}%)\n"
     msg += f"🛑 Stop Loss:  {len(sl_trades):>3}  ({len(sl_trades)/total_trades*100:.1f}%)\n"
+    msg += f"⏰ Expired:    {len(expired_trades):>3}  ({len(expired_trades)/total_trades*100:.1f}%)\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🏆 Win Rate:   {win_rate:.1f}%\n"
     msg += f"📈 Avg Win:    +{avg_win:.2f}%\n"
-    msg += f"📉 Avg Loss:   {avg_loss:.2f}%"
+    msg += f"📉 Avg Loss:   {avg_loss:.2f}%\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "<b>TRADE LOG:</b>\n"
+    
+    # Newest first
+    for r in sorted(trades, key=lambda x: x.get("closed_at", 0), reverse=True):
+        ic = icon.get(r["result"], "•")
+        lb = label.get(r["result"], r["result"])
+        pnl = r["pnl_percent"]
+        sign = "+" if pnl >= 0 else ""
+        msg += f"{ic} {r['symbol']} → {lb}  {sign}{pnl:.2f}%\n"
     
     return msg
 
@@ -903,7 +1003,7 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.1 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.3 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
@@ -915,7 +1015,7 @@ def handle_telegram_command(command_text):
         
         send_telegram_message(msg)
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9.2.1 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.2.3 Commands</b>\n\n"
         msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -1059,6 +1159,21 @@ def execute_market_scan():
     
     print(f"Scan #{current_scan} | Candidates: {len(top_candidates)}")
     
+    # v9.2.3: add 120h accumulation-quality bonus (up to +10) to top candidates only.
+    # This runs on the ~15 top candidates, not the whole market, to stay within rate limits.
+    for c in top_candidates:
+        try:
+            bonus, reason = analyze_accumulation_quality(c["symbol"])
+        except Exception as e:
+            bonus, reason = 0, "accum error"
+        c["accum_bonus"] = bonus
+        c["accum_reason"] = reason
+        c["base_score"] = c["score"]
+        c["score"] = min(c["score"] + bonus, 100)
+    
+    # re-sort now that bonuses are applied
+    top_candidates.sort(key=lambda x: x["score"], reverse=True)
+    
     strict_candidates = [c for c in top_candidates if c["score"] >= STRICT_SCORE_THRESHOLD]
     
     with alerted_lock:
@@ -1084,7 +1199,7 @@ def scanner_main_loop():
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9.2.1 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.2.3 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Breakout Momentum Detection (≥70/100)\n"
@@ -1135,7 +1250,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9.2.1 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.2.3 — STOPPED</b>\n\n"
         f"Total scans: {scan_count}"
     )
     
@@ -1154,7 +1269,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9.2.1 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.2.3 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1175,7 +1290,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test from v9.2.1")
+    send_telegram_message("🧪 Test from v9.2.3")
     return "Test sent"
 
 @app.route("/scan")
@@ -1208,7 +1323,7 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.2.1",
+        "version": "9.2.3",
         "mode": "STRICT"
     })
 
