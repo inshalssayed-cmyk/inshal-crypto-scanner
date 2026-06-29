@@ -666,7 +666,7 @@ def send_watchlist_alert(symbol, price, score, sector, smart_money, plan=None, s
     msg += f"🎯 TP2: {format_price_display(tp2)} (+{TARGET_2_PERCENT:.0f}%)\n"
     msg += f"🛑 SL: {format_price_display(sl)} (-{STOP_LOSS_PERCENT:.0f}%)\n\n"
     msg += "⏰ STATUS: MONITORING\n"
-    msg += "Will fire BUY when price reaches entry + momentum confirms. ✅"
+    msg += "Will fire BUY the moment price reaches the entry price. ✅"
     
     send_telegram_message(msg)
 
@@ -1202,12 +1202,13 @@ def scanner_main_loop():
         "🟢 <b>Inshal Crypto Scanner v9.2.3 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
-        "⚡ Breakout Momentum Detection (≥70/100)\n"
+        "⚡ Momentum used for SELECTION only (not entry)\n"
         "📐 Brooks Price-Action Entry Engine\n"
         f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%\n\n"
-        "<b>v9.2 CHANGES:</b>\n"
+        "<b>HOW ENTRY WORKS:</b>\n"
         "• Entry derived from swing-low / range bottom\n"
-        "• BUY fires when price reaches the planned entry\n"
+        "• BUY fires the moment price reaches entry\n"
+        "• No momentum check on entry\n"
         "• TP1 4% / TP2 8%\n"
         "• 🔁 Times-Seen counter per coin\n\n"
         "95% accuracy target. In Sha Allah. 🚀"
