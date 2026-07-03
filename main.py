@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.2.3 (STRICT MODE - PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.2.4 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
 # v9.2: Brooks price-action entry, fixed entry trigger, 4%/8% targets, seen counter
@@ -671,14 +671,18 @@ def send_watchlist_alert(symbol, price, score, sector, smart_money, plan=None, s
     send_telegram_message(msg)
 
 def check_watchlist_for_entry_conditions():
-    """Monitor watchlist — fire BUY when price has TOUCHED the planned entry.
+    """Monitor watchlist — fire BUY only when price has genuinely TOUCHED the
+    stored planned entry AFTER the coin was added.
 
-    v9.2.1 changes:
-      • Fill is detected from the recent candle LOW, not just the live price,
-        so dips between 3-min checks are not missed.
-      • Momentum gate removed from entry (the coin already passed momentum at
-        selection time; re-checking it here was blocking real fills).
+    v9.2.4 fixes:
+      • Reads enough candle history to cover the entire time the coin has been
+        watched (old 4h window missed dips on long-watched coins).
+      • Fills at the STORED planned entry, so the BUY price matches the
+        watchlist price exactly (no recalculated candle-low mismatch).
+      • Only counts candles that closed AFTER the coin was added, proven by
+        timestamp — no phantom fills from old price history.
     """
+    now = time.time()
     with watchlist_lock:
         symbols_to_check = list(watchlist.keys())
     
@@ -687,42 +691,46 @@ def check_watchlist_for_entry_conditions():
             with watchlist_lock:
                 item = dict(watchlist[symbol])
             
+            # Never open a second position for a coin already being tracked
+            with positions_lock:
+                if symbol in tracked_positions and not tracked_positions[symbol].get("closed"):
+                    continue
+            
             planned_entry = item.get("planned_entry")
             if not planned_entry:
                 continue
             
             entry_band_high = planned_entry * (1 + ENTRY_FILL_TOLERANCE / 100)
-            added_at = item.get("added_at", 0)
+            added_at = item.get("added_at", now)
             
-            # Look at recent candles to see if price dipped into the entry band
-            # at any point since the coin was added (catches wicks between checks).
+            # How many 15-min candles cover the time since the coin was added?
+            # 4 candles/hour, +8 buffer, capped at 200 (KuCoin max ~1500 but keep sane).
+            hours_watched = max(1, (now - added_at) / 3600)
+            needed = int(hours_watched * 4) + 8
+            needed = min(needed, 200)
+            
             touched = False
-            fill_price = None
-            klines = fetch_kline_data(symbol, "15min", 16)
+            fill_time = None
+            klines = fetch_kline_data(symbol, "15min", needed)
             if klines:
-                # Only consider candles at/after the coin was added, but never
-                # let an old added_at blank out the whole window — if everything
-                # would be filtered, fall back to the full recent window.
-                usable = [k for k in klines if int(k[0]) >= added_at - 900]
-                if not usable:
-                    usable = klines
-                for k in usable:
+                for k in klines:
                     # KuCoin kline: [time, open, close, high, low, volume, turnover]
+                    k_time = int(k[0])
+                    # Only candles that closed AFTER the coin was added count.
+                    if k_time < added_at:
+                        continue
                     k_low = float(k[4])
                     if k_low <= entry_band_high:
                         touched = True
-                        fill_price = min(planned_entry, k_low) if k_low < planned_entry else planned_entry
+                        fill_time = k_time
                         break
-            
-            # Fallback: also check the live price directly
-            if not touched:
-                current_price = fetch_current_price(symbol)
-                if current_price and current_price <= entry_band_high:
-                    touched = True
-                    fill_price = min(current_price, planned_entry)
             
             if not touched:
                 continue
+            
+            # Fill at the STORED planned entry (locked at watchlist time),
+            # so the BUY price always matches what message 1 promised.
+            fill_price = planned_entry
             
             item["structure"] = classify_market_structure(symbol)
             
@@ -732,7 +740,8 @@ def check_watchlist_for_entry_conditions():
             send_entry_alert(symbol, fill_price, item, None, "entry touched",
                              item.get("swing_low") or planned_entry)
             
-            add_position_for_tracking(symbol, fill_price, scan_count, item["sector"], item["score"])
+            add_position_for_tracking(symbol, fill_price, scan_count, item["sector"],
+                                      item["score"], item.get("basis", "unknown"))
             
             with watchlist_lock:
                 if symbol in watchlist:
@@ -769,13 +778,12 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
     msg += f"🛑 STOP LOSS: {format_price_display(sl_price)}  (-{STOP_LOSS_PERCENT:.0f}%)\n\n"
     
     msg += f"⚖️ Risk/Reward: 1:{rr_ratio:.1f}\n"
-    msg += f"📊 Win Probability: 95%\n"
     msg += f"🔁 Times Seen: {watchlist_item.get('seen', 1)}\n"
     msg += f"⭐ Score: {watchlist_item['score']}/100\n\n"
     
     msg += "━━━━━━━━━━━━━━━━━\n"
-    msg += "✅ TIME TO BUY\n"
-    msg += "All factors aligned. Enter now."
+    msg += "✅ ENTRY TRIGGERED\n"
+    msg += "Price reached the planned entry level."
     
     send_telegram_message(msg)
 
@@ -783,7 +791,7 @@ def send_entry_alert(symbol, entry_price, watchlist_item, momentum_score, moment
 # POSITION TRACKING
 # ============================================================================
 
-def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", score=0):
+def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", score=0, basis="unknown"):
     """Register position"""
     tp1 = entry_price * (1 + TARGET_1_PERCENT / 100)
     tp2 = entry_price * (1 + TARGET_2_PERCENT / 100)
@@ -799,6 +807,7 @@ def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", sc
             "scan_id": scan_id,
             "sector": sector,
             "score": score,
+            "basis": basis,
             "tp1_hit": False,
             "tp2_hit": False,
             "sl_hit": False,
@@ -806,9 +815,9 @@ def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", sc
         }
     
     persist_all_state()
-    print(f"Position: {symbol} @ {entry_price}")
+    print(f"Position: {symbol} @ {entry_price} [{basis}]")
 
-def save_trade_result(symbol, sector, score, entry_price, exit_price, result_type):
+def save_trade_result(symbol, sector, score, entry_price, exit_price, result_type, basis="unknown"):
     """Save trade result"""
     pnl_percent = ((exit_price - entry_price) / entry_price) * 100
     duration_hours = (time.time() - tracked_positions[symbol]["alerted_at"]) / 3600
@@ -821,6 +830,7 @@ def save_trade_result(symbol, sector, score, entry_price, exit_price, result_typ
         "exit": exit_price,
         "result": result_type,
         "pnl_percent": round(pnl_percent, 2),
+        "basis": basis,
         "closed_at": time.time(),
         "duration_hours": round(duration_hours, 1)
     }
@@ -829,10 +839,12 @@ def save_trade_result(symbol, sector, score, entry_price, exit_price, result_typ
         all_results.append(trade_record)
     
     persist_all_state()
-    print(f"Trade: {symbol} {result_type} {pnl_percent:.2f}%")
+    print(f"Trade: {symbol} {result_type} {pnl_percent:.2f}% [{basis}]")
 
 def monitor_tracked_positions():
-    """Monitor positions"""
+    """Monitor positions. TP/SL are confirmed from candle highs/lows that occur
+    AFTER the position opened (v9.2.4), so a deep entry can't instantly report a
+    target 'hit' by comparing a stale live price to the target."""
     with positions_lock:
         symbols = list(tracked_positions.keys())
     
@@ -845,49 +857,74 @@ def monitor_tracked_positions():
         if pos["closed"]:
             continue
         
+        opened_at = pos.get("alerted_at", current_time)
+        
+        # Pull candles since the position opened to check real highs/lows.
+        hours_open = max(1, (current_time - opened_at) / 3600)
+        needed = min(int(hours_open * 4) + 4, 200)
+        klines = fetch_kline_data(symbol, "15min", needed)
+        
+        post_high = None
+        post_low = None
+        if klines:
+            for k in klines:
+                k_time = int(k[0])
+                if k_time < opened_at:
+                    continue
+                k_high = float(k[3])
+                k_low = float(k[4])
+                post_high = k_high if post_high is None else max(post_high, k_high)
+                post_low = k_low if post_low is None else min(post_low, k_low)
+        
         current_price = fetch_current_price(symbol)
         if not current_price:
             current_price = pos["entry"]
         
+        # If no post-entry candles yet, fall back to live price for display only
+        hi = post_high if post_high is not None else current_price
+        lo = post_low if post_low is not None else current_price
+        
         change_percent = ((current_price - pos["entry"]) / pos["entry"]) * 100
         
-        if current_time - pos["alerted_at"] > TRACK_MAX_DURATION:
-            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "EXPIRED")
-            
+        if current_time - opened_at > TRACK_MAX_DURATION:
+            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "EXPIRED", pos.get("basis","unknown"))
             msg = f"⏰ <b>EXPIRED (48h)</b>\n\n<b>{symbol}</b>\n{format_percentage(change_percent)}"
             send_telegram_message(msg)
             to_remove.append(symbol)
             continue
         
-        if current_price >= pos["tp2"] and not pos["tp2_hit"]:
+        # TP2 — needs a post-entry candle high to reach it
+        if hi >= pos["tp2"] and not pos["tp2_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["tp2_hit"] = True
                 tracked_positions[symbol]["closed"] = True
-            
-            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "TP2")
-            
-            msg = f"🚀 <b>TARGET 2 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
+            exit_p = pos["tp2"]
+            pnl = ((exit_p - pos["entry"]) / pos["entry"]) * 100
+            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], exit_p, "TP2", pos.get("basis","unknown"))
+            msg = f"🚀 <b>TARGET 2 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(exit_p)}\n+{pnl:.2f}%"
             send_telegram_message(msg)
             to_remove.append(symbol)
             continue
         
-        if current_price >= pos["tp1"] and not pos["tp1_hit"]:
+        # TP1
+        if hi >= pos["tp1"] and not pos["tp1_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["tp1_hit"] = True
-            
-            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "TP1")
-            
-            msg = f"✅ <b>TARGET 1 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
+            exit_p = pos["tp1"]
+            pnl = ((exit_p - pos["entry"]) / pos["entry"]) * 100
+            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], exit_p, "TP1", pos.get("basis","unknown"))
+            msg = f"✅ <b>TARGET 1 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(exit_p)}\n+{pnl:.2f}%"
             send_telegram_message(msg)
         
-        elif current_price <= pos["sl"] and not pos["sl_hit"]:
+        # SL — needs a post-entry candle low to reach it
+        elif lo <= pos["sl"] and not pos["sl_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["sl_hit"] = True
                 tracked_positions[symbol]["closed"] = True
-            
-            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], current_price, "SL")
-            
-            msg = f"🛑 <b>STOP LOSS</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(current_price)}\n{format_percentage(change_percent)}"
+            exit_p = pos["sl"]
+            pnl = ((exit_p - pos["entry"]) / pos["entry"]) * 100
+            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], exit_p, "SL", pos.get("basis","unknown"))
+            msg = f"🛑 <b>STOP LOSS</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(exit_p)}\n{pnl:.2f}%"
             send_telegram_message(msg)
             to_remove.append(symbol)
     
@@ -948,6 +985,33 @@ def generate_performance_report(days=None):
     msg += f"📈 Avg Win:    +{avg_win:.2f}%\n"
     msg += f"📉 Avg Loss:   {avg_loss:.2f}%\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    
+    # Entry-basis breakdown: compare capped vs tight-range vs other
+    def basis_group(b):
+        b = (b or "").lower()
+        if "capped" in b:
+            return "Capped (deep)"
+        if "tight" in b:
+            return "Tight range"
+        if "swing-low" in b:
+            return "Swing-low"
+        return "Other"
+    
+    groups = {}
+    for r in trades:
+        g = basis_group(r.get("basis"))
+        groups.setdefault(g, {"n": 0, "wins": 0})
+        groups[g]["n"] += 1
+        if r["result"] in ("TP1", "TP2"):
+            groups[g]["wins"] += 1
+    
+    if groups:
+        msg += "<b>BY ENTRY TYPE:</b>\n"
+        for g, d in groups.items():
+            wr = (d["wins"] / d["n"] * 100) if d["n"] else 0
+            msg += f"• {g}: {d['wins']}/{d['n']} win ({wr:.0f}%)\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    
     msg += "<b>TRADE LOG:</b>\n"
     
     # Newest first
@@ -956,7 +1020,8 @@ def generate_performance_report(days=None):
         lb = label.get(r["result"], r["result"])
         pnl = r["pnl_percent"]
         sign = "+" if pnl >= 0 else ""
-        msg += f"{ic} {r['symbol']} → {lb}  {sign}{pnl:.2f}%\n"
+        bshort = basis_group(r.get("basis")).split()[0]
+        msg += f"{ic} {r['symbol']} → {lb}  {sign}{pnl:.2f}%  [{bshort}]\n"
     
     return msg
 
@@ -1003,7 +1068,7 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.3 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.4 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
@@ -1015,7 +1080,7 @@ def handle_telegram_command(command_text):
         
         send_telegram_message(msg)
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9.2.3 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.2.4 Commands</b>\n\n"
         msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -1183,10 +1248,19 @@ def execute_market_scan():
     
     new_alerts = []
     for c in strict_candidates:
-        if c["symbol"] not in last_alerted:
-            new_alerts.append(c)
-            with alerted_lock:
-                last_alerted[c["symbol"]] = time.time()
+        sym = c["symbol"]
+        # Skip if already on cooldown, already in watchlist, or already a live position
+        if sym in last_alerted:
+            continue
+        with watchlist_lock:
+            if sym in watchlist:
+                continue
+        with positions_lock:
+            if sym in tracked_positions and not tracked_positions[sym].get("closed"):
+                continue
+        new_alerts.append(c)
+        with alerted_lock:
+            last_alerted[sym] = time.time()
     
     for c in new_alerts:
         plan = calculate_brooks_entry(c["symbol"], c["price"])
@@ -1199,7 +1273,7 @@ def scanner_main_loop():
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9.2.3 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.2.4 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Momentum used for SELECTION only (not entry)\n"
@@ -1251,7 +1325,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9.2.3 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.2.4 — STOPPED</b>\n\n"
         f"Total scans: {scan_count}"
     )
     
@@ -1270,7 +1344,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9.2.3 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.2.4 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1291,7 +1365,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test from v9.2.3")
+    send_telegram_message("🧪 Test from v9.2.4")
     return "Test sent"
 
 @app.route("/scan")
@@ -1324,7 +1398,7 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.2.3",
+        "version": "9.2.4",
         "mode": "STRICT"
     })
 
