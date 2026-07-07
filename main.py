@@ -9,7 +9,7 @@ from flask import Flask, jsonify
 from datetime import datetime
 
 # ============================================================================
-# INSHAL CRYPTO SCANNER v9.2.4 (STRICT MODE - PRODUCTION)
+# INSHAL CRYPTO SCANNER v9.2.6 (STRICT MODE - PRODUCTION)
 # ============================================================================
 # 95% Accuracy Pre-Breakout Detection System
 # v9.2: Brooks price-action entry, fixed entry trigger, 4%/8% targets, seen counter
@@ -35,6 +35,22 @@ KUCOIN_KLINES = f"{KUCOIN_BASE_URL}/market/candles"
 
 # STRICT MODE: Score & Momentum Thresholds
 STRICT_SCORE_THRESHOLD = 85  # STRICT: Only elite coins
+
+# v9.2.6: per-entry-type score thresholds.
+# The entry type (basis) is calculated first, then the matching threshold applies.
+#   swing-low  -> needs >= 85
+#   tight / deep(capped) / fallback -> needs >= 65
+ENTRY_TYPE_THRESHOLDS = {
+    "swing-low + buffer": 85,
+    "tight range near support": 65,
+    "deep swing-low (capped)": 65,
+    "fallback": 65,
+}
+DEFAULT_TYPE_THRESHOLD = 65
+
+def threshold_for_basis(basis):
+    """Return the score threshold required for a given entry basis."""
+    return ENTRY_TYPE_THRESHOLDS.get(basis, DEFAULT_TYPE_THRESHOLD)
 MAX_PRICE_CHANGE = 8
 MIN_PRICE_CHANGE = -2
 MIN_VOLUME_FOR_ALERT = 3_000_000
@@ -71,7 +87,10 @@ MAX_SUPPORT_DISTANCE_PERCENT = 2.0  # STRICT: Tight entry zone
 # v9.2.3: 120-hour accumulation-quality bonus
 # Reads 5 days of 1h candles for top candidates only and awards up to +10
 # for a genuine multi-day base (tight range, holding up, no prior blow-off).
-ACCUM_LOOKBACK_HOURS = 120
+# v9.2.5: accumulation-quality lookback is now adjustable.
+# Presets: 72h / 120h / 168h. Change ACCUM_LOOKBACK_HOURS to one of these.
+ACCUM_LOOKBACK_PRESETS = {"short": 72, "medium": 120, "long": 168}
+ACCUM_LOOKBACK_HOURS = ACCUM_LOOKBACK_PRESETS["medium"]   # 120h default
 ACCUM_MAX_BONUS = 10
 
 # File Storage
@@ -573,18 +592,10 @@ def calculate_accumulation_score(price_change, volume, rs_vs_btc, sector, base_s
     elif sector != "Unclassified":
         score += 7
     
-    # Cartel historical
-    if base_symbol in CARTEL_HISTORICAL_COINS:
-        score += 10
-    
-    # Smart money proxy
+    # Smart money proxy (flat price + strong volume together)
     if (-1 <= price_change <= 4) and (volume >= 5_000_000):
         score += 10
         smart_money_signal = True
-    
-    # Smart money watchlist
-    if base_symbol in SMART_MONEY_WATCHLIST:
-        score += 8
     
     # Consecutive bonus
     score += get_consecutive_appearance_bonus(symbol)
@@ -811,6 +822,7 @@ def add_position_for_tracking(symbol, entry_price, scan_id, sector="Unknown", sc
             "tp1_hit": False,
             "tp2_hit": False,
             "sl_hit": False,
+            "breakeven": False,
             "closed": False
         }
     
@@ -906,18 +918,36 @@ def monitor_tracked_positions():
             to_remove.append(symbol)
             continue
         
-        # TP1
+        # TP1 — book 50%, move stop to breakeven, keep remaining 50% for TP2
         if hi >= pos["tp1"] and not pos["tp1_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["tp1_hit"] = True
+                tracked_positions[symbol]["breakeven"] = True
             exit_p = pos["tp1"]
             pnl = ((exit_p - pos["entry"]) / pos["entry"]) * 100
             save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], exit_p, "TP1", pos.get("basis","unknown"))
-            msg = f"✅ <b>TARGET 1 HIT!</b>\n\n<b>{symbol}</b>\n{format_price_display(pos['entry'])} → {format_price_display(exit_p)}\n+{pnl:.2f}%"
+            msg = f"✅ <b>TARGET 1 HIT — BOOK 50%</b>\n\n<b>{symbol}</b>\n"
+            msg += f"{format_price_display(pos['entry'])} → {format_price_display(exit_p)}  (+{pnl:.2f}%)\n\n"
+            msg += "📌 Sell 50% now (profit booked).\n"
+            msg += f"🛡 Stop moved to BREAKEVEN ({format_price_display(pos['entry'])}).\n"
+            msg += f"🎯 Remaining 50% targets TP2 {format_price_display(pos['tp2'])} (+{TARGET_2_PERCENT:.0f}%)."
             send_telegram_message(msg)
         
-        # SL — needs a post-entry candle low to reach it
-        elif lo <= pos["sl"] and not pos["sl_hit"]:
+        # Breakeven exit — after TP1, if price falls back to entry, sell the rest at entry
+        elif pos.get("breakeven") and lo <= pos["entry"] and not pos["sl_hit"]:
+            with positions_lock:
+                tracked_positions[symbol]["sl_hit"] = True
+                tracked_positions[symbol]["closed"] = True
+            exit_p = pos["entry"]
+            save_trade_result(symbol, pos["sector"], pos["score"], pos["entry"], exit_p, "BREAKEVEN", pos.get("basis","unknown"))
+            msg = f"⚖️ <b>BREAKEVEN EXIT</b>\n\n<b>{symbol}</b>\n"
+            msg += f"Remaining 50% sold at entry {format_price_display(pos['entry'])} (0.00%).\n"
+            msg += "First half already booked at TP1 — trade net positive. ✅"
+            send_telegram_message(msg)
+            to_remove.append(symbol)
+        
+        # SL — only before TP1 (once TP1 hits, stop is breakeven, handled above)
+        elif not pos.get("breakeven") and lo <= pos["sl"] and not pos["sl_hit"]:
             with positions_lock:
                 tracked_positions[symbol]["sl_hit"] = True
                 tracked_positions[symbol]["closed"] = True
@@ -963,6 +993,7 @@ def generate_performance_report(days=None):
     tp2_trades = [r for r in trades if r["result"] == "TP2"]
     sl_trades = [r for r in trades if r["result"] == "SL"]
     expired_trades = [r for r in trades if r["result"] == "EXPIRED"]
+    be_trades = [r for r in trades if r["result"] == "BREAKEVEN"]
     
     winning_trades = tp1_trades + tp2_trades
     win_rate = (len(winning_trades) / total_trades * 100) if total_trades else 0
@@ -970,8 +1001,8 @@ def generate_performance_report(days=None):
     avg_loss = (sum(r["pnl_percent"] for r in sl_trades) / len(sl_trades)) if sl_trades else 0
     
     # Icon per result type
-    icon = {"TP2": "🚀", "TP1": "✅", "SL": "🛑", "EXPIRED": "⏰"}
-    label = {"TP2": "TP2", "TP1": "TP1", "SL": "SL", "EXPIRED": "Expired"}
+    icon = {"TP2": "🚀", "TP1": "✅", "SL": "🛑", "EXPIRED": "⏰", "BREAKEVEN": "⚖️"}
+    label = {"TP2": "TP2", "TP1": "TP1", "SL": "SL", "EXPIRED": "Expired", "BREAKEVEN": "Breakeven"}
     
     msg = f"📊 <b>Scanner Performance Report</b>\n"
     msg += f"🗓 {period_label} | {total_trades} trade(s)\n"
@@ -979,6 +1010,7 @@ def generate_performance_report(days=None):
     msg += f"🚀 TP2 Hit:    {len(tp2_trades):>3}  ({len(tp2_trades)/total_trades*100:.1f}%)\n"
     msg += f"✅ TP1 Hit:    {len(tp1_trades):>3}  ({len(tp1_trades)/total_trades*100:.1f}%)\n"
     msg += f"🛑 Stop Loss:  {len(sl_trades):>3}  ({len(sl_trades)/total_trades*100:.1f}%)\n"
+    msg += f"⚖️ Breakeven:  {len(be_trades):>3}  ({len(be_trades)/total_trades*100:.1f}%)\n"
     msg += f"⏰ Expired:    {len(expired_trades):>3}  ({len(expired_trades)/total_trades*100:.1f}%)\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🏆 Win Rate:   {win_rate:.1f}%\n"
@@ -1068,19 +1100,19 @@ def handle_telegram_command(command_text):
         with watchlist_lock:
             watchlist_count = len(watchlist)
         
-        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.4 Status</b>\n\n"
+        msg = f"🤖 <b>Inshal Crypto Scanner v9.2.6 Status</b>\n\n"
         msg += f"✅ Running: {scanner_running}\n"
         msg += f"🔢 Scans Completed: {scan_count}\n"
         msg += f"📡 Active Positions: {active_count}\n"
         msg += f"👁 Coins in Watchlist: {watchlist_count}\n"
         msg += f"📊 Total Results Logged: {results_count}\n"
-        msg += f"📏 Score Threshold: ≥{STRICT_SCORE_THRESHOLD}\n"
+        msg += f"📏 Threshold: Swing-low ≥85 | Others ≥65\n"
         msg += f"⚡ Momentum Detection: {'ENABLED' if MOMENTUM_CHECK_ENABLED else 'DISABLED'}\n"
         msg += f"🎯 TP1: +{TARGET_1_PERCENT:.0f}%  TP2: +{TARGET_2_PERCENT:.0f}%  SL: -{STOP_LOSS_PERCENT:.0f}%"
         
         send_telegram_message(msg)
     elif cmd == "/help":
-        msg = "🤖 <b>Inshal Crypto Scanner v9.2.4 Commands</b>\n\n"
+        msg = "🤖 <b>Inshal Crypto Scanner v9.2.6 Commands</b>\n\n"
         msg += "/results — All-time\n"
         msg += "/results7 — Last 7 days\n"
         msg += "/results30 — Last 30 days\n"
@@ -1239,7 +1271,20 @@ def execute_market_scan():
     # re-sort now that bonuses are applied
     top_candidates.sort(key=lambda x: x["score"], reverse=True)
     
-    strict_candidates = [c for c in top_candidates if c["score"] >= STRICT_SCORE_THRESHOLD]
+    # v9.2.6: compute the entry plan FIRST so we know each coin's type,
+    # then apply that type's own threshold (swing-low 85, others 65).
+    strict_candidates = []
+    for c in top_candidates:
+        # Only bother computing entry for coins that could pass the lowest bar
+        if c["score"] < DEFAULT_TYPE_THRESHOLD:
+            continue
+        plan = calculate_brooks_entry(c["symbol"], c["price"])
+        basis = plan["basis"] if plan else "fallback"
+        needed = threshold_for_basis(basis)
+        if c["score"] >= needed:
+            c["plan"] = plan
+            c["basis"] = basis
+            strict_candidates.append(c)
     
     with alerted_lock:
         expired_keys = [k for k, t in last_alerted.items() if time.time() - t > ALERT_COOLDOWN_SECONDS]
@@ -1263,7 +1308,7 @@ def execute_market_scan():
             last_alerted[sym] = time.time()
     
     for c in new_alerts:
-        plan = calculate_brooks_entry(c["symbol"], c["price"])
+        plan = c.get("plan") or calculate_brooks_entry(c["symbol"], c["price"])
         seen = c.get("seen", get_seen_count(c["symbol"]))
         send_watchlist_alert(c["symbol"], c["price"], c["score"], c["sector"], c["smart"], plan, seen)
         add_coin_to_watchlist(c["symbol"], c["price"], c["score"], c["sector"], c["smart"], plan, seen)
@@ -1273,7 +1318,7 @@ def scanner_main_loop():
     global scanner_running
     
     send_telegram_message(
-        "🟢 <b>Inshal Crypto Scanner v9.2.4 — STARTED</b>\n\n"
+        "🟢 <b>Inshal Crypto Scanner v9.2.6 — STARTED</b>\n\n"
         "✅ Two-Stage Alerting System\n"
         "🎯 Elite Pre-Breakout Detection (Score ≥85)\n"
         "⚡ Momentum used for SELECTION only (not entry)\n"
@@ -1325,7 +1370,7 @@ def handle_sigterm_signal(signum, frame):
     shutdown_flag.set()
     
     send_telegram_message(
-        f"🔴 <b>Inshal Crypto Scanner v9.2.4 — STOPPED</b>\n\n"
+        f"🔴 <b>Inshal Crypto Scanner v9.2.6 — STOPPED</b>\n\n"
         f"Total scans: {scan_count}"
     )
     
@@ -1344,7 +1389,7 @@ def route_home():
     with watchlist_lock:
         wl = len(watchlist)
     
-    return f"v9.2.4 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
+    return f"v9.2.6 | Scans: {scan_count} | Active: {active} | Watchlist: {wl}"
 
 @app.route("/health")
 def route_health():
@@ -1365,7 +1410,7 @@ def route_health():
 
 @app.route("/test")
 def route_test():
-    send_telegram_message("🧪 Test from v9.2.4")
+    send_telegram_message("🧪 Test from v9.2.6")
     return "Test sent"
 
 @app.route("/scan")
@@ -1398,7 +1443,7 @@ def route_status():
         "watchlist": wl,
         "results": results_count,
         "momentum_enabled": MOMENTUM_CHECK_ENABLED,
-        "version": "9.2.4",
+        "version": "9.2.6",
         "mode": "STRICT"
     })
 
